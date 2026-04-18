@@ -1251,11 +1251,12 @@ function ApiKeyGuide() {
     claude: {
       title: "Claude (Anthropic) APIキー取得手順",
       color: "from-orange-500 to-red-500",
-      tagline: "最高精度。論文解析の本命。ただし無料枠なし。",
+      tagline: "最高精度。論文解析の本命。ただし無料枠なし。Max/Pro Plan加入者も別途API契約が必要。",
       steps: [
-        { t: "アカウント作成", d: "console.anthropic.com にアクセスし、メールアドレスと電話番号でサインアップ（電話番号認証が必須）" },
-        { t: "支払い情報の登録", d: "Settings → **Billing** で「Add Credit」。クレジットカード登録後、**最低 $5** の前払いクレジットを購入します（無料枠なし）" },
-        { t: "APIキーの作成", d: "Settings → **API Keys** → 「Create Key」。ワークスペースとキー名を選んで生成。**sk-ant-** で始まる文字列が発行されます" },
+        { t: "⚠️ 最重要：claude.ai と API は別サービス", d: "**claude.ai（チャット版。Free/Pro/Max/Team Plan すべて）と console.anthropic.com（API）は完全に別の契約・別の課金**です。**Max Plan（$100/月〜）に加入していても API は 1 円も使えません**。claude.ai の Settings 画面には API キー発行機能は**ありません**。アクセス先を間違えないよう注意（claude.ai ではなく **console.anthropic.com**）" },
+        { t: "API用アカウント作成", d: "**console.anthropic.com** にアクセスし、メールアドレスと電話番号でサインアップ（電話番号認証が必須）。claude.ai と同じメールでログインしても、**API用の組織（Organization）は別途作成**されます" },
+        { t: "支払い情報の登録（Max Planとは別建て）", d: "Settings → **Billing** で「Add Credit」。クレジットカード登録後、**最低 $5** の前払いクレジットを購入します（無料枠なし）。**Max Plan の月額料金とは完全に別の課金**で、API利用分はここから消費されます。論文1本あたり Opus 4.7 で $0.5〜$2 程度" },
+        { t: "APIキーの作成", d: "console.anthropic.com の Settings → **API Keys** → 「Create Key」。ワークスペースとキー名を選んで生成。**sk-ant-** で始まる文字列が発行されます（claude.ai 側には絶対に表示されません）" },
         { t: "本アプリへ貼り付け", d: "上の Claude カードで有効化 → キーを貼付 → 接続テスト" }
       ],
       pricing: [
