@@ -394,6 +394,14 @@ const SUPPLEMENT_SCHEMA_JSON = {
 };
 const SUPPLEMENT_SCHEMA_GEMINI = toGeminiSchema(SUPPLEMENT_SCHEMA_JSON);
 
+// 単一アウトカム抽出用スキーマ：PDFの選択範囲（文字 or 画像）から1個のアウトカムを抽出
+const SINGLE_OUTCOME_SCHEMA_JSON = {
+  type: "object",
+  properties: EXTRACT_SCHEMA_JSON.properties.extractedOutcomes.items.properties,
+  required: ["actualOutcomeName", "evidenceText"]
+};
+const SINGLE_OUTCOME_SCHEMA_GEMINI = toGeminiSchema(SINGLE_OUTCOME_SCHEMA_JSON);
+
 const CRITIC_SCHEMA = {
   type: "object",
   properties: {
@@ -749,8 +757,12 @@ const saveConfig = (cfg) => {
 /* ============================================================
    SECTION 6: PDF VIEWER
    ============================================================ */
-function PdfPage({ pdf, pageNum, scale }) {
+function PdfPage({ pdf, pageNum, scale, selectionMode, onAreaSelect, extracting }) {
   const canvasRef = useRef(null); const textRef = useRef(null); const [w, setW] = useState('auto');
+  const overlayRef = useRef(null);
+  // 範囲選択の描画状態
+  const [draw, setDraw] = useState(null); // {sx,sy,x,y,w,h,active}
+
   useEffect(() => {
     let task;
     const render = async () => {
@@ -768,11 +780,86 @@ function PdfPage({ pdf, pageNum, scale }) {
       } catch (e) { if (e.name !== 'RenderingCancelledException') console.warn(e); }
     }; render(); return () => { if (task) try { task.cancel(); } catch (e) {} };
   }, [pdf, pageNum, scale]);
-  return (<div id={`pdf-page-${pageNum}`} className="bg-white shadow-lg relative rounded overflow-hidden flex-shrink-0 mx-auto mb-4" style={{width:w}}><canvas ref={canvasRef} className="block"/><div ref={textRef} className="textLayer"/><div className="absolute top-1.5 left-1.5 bg-black/60 text-white text-[9px] font-mono px-1.5 py-0.5 rounded-full z-20">P.{pageNum}</div></div>);
+
+  // 範囲選択ハンドラ
+  const onMouseDown = (e) => {
+    if (selectionMode !== 'area') return;
+    e.preventDefault();
+    const r = overlayRef.current.getBoundingClientRect();
+    const sx = e.clientX - r.left, sy = e.clientY - r.top;
+    setDraw({ sx, sy, x: sx, y: sy, w: 0, h: 0, active: true });
+  };
+  const onMouseMove = (e) => {
+    if (!draw?.active) return;
+    const r = overlayRef.current.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;
+    setDraw(d => ({ ...d, x: Math.min(d.sx, cx), y: Math.min(d.sy, cy), w: Math.abs(cx - d.sx), h: Math.abs(cy - d.sy) }));
+  };
+  const onMouseUp = () => {
+    if (!draw?.active) return;
+    if (draw.w < 15 || draw.h < 15) { setDraw(null); return; }
+    setDraw(d => ({ ...d, active: false }));
+  };
+
+  const confirmArea = () => {
+    if (!draw || !canvasRef.current) return;
+    // キャンバスから選択範囲を切り出して画像化（解像度2倍に拡大して文字認識精度を上げる）
+    const cv = canvasRef.current;
+    const tmp = document.createElement('canvas');
+    const upscale = 2;
+    tmp.width = Math.round(draw.w * upscale);
+    tmp.height = Math.round(draw.h * upscale);
+    const ctx = tmp.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(cv, draw.x, draw.y, draw.w, draw.h, 0, 0, tmp.width, tmp.height);
+    const imgData = tmp.toDataURL('image/jpeg', 0.95).split(',')[1];
+    onAreaSelect && onAreaSelect({ pageNum, image: imgData });
+    setDraw(null);
+  };
+
+  const cancelArea = () => setDraw(null);
+
+  // テキスト選択を妨げないように pointerEvents を制御
+  const overlayPE = selectionMode === 'area' ? 'auto' : 'none';
+
+  return (
+    <div id={`pdf-page-${pageNum}`} className="bg-white shadow-lg relative rounded overflow-hidden flex-shrink-0 mx-auto mb-4" style={{width:w}}>
+      <canvas ref={canvasRef} className="block"/>
+      <div ref={textRef} className="textLayer" style={{pointerEvents: selectionMode === 'area' ? 'none' : 'auto'}}/>
+      {/* 範囲選択オーバーレイ */}
+      <div ref={overlayRef}
+           className={`absolute inset-0 z-30 ${selectionMode === 'area' ? 'cursor-crosshair' : ''}`}
+           style={{pointerEvents: overlayPE}}
+           onMouseDown={onMouseDown}
+           onMouseMove={onMouseMove}
+           onMouseUp={onMouseUp}
+           onMouseLeave={onMouseUp}/>
+      {/* 描画中の矩形 */}
+      {draw && (
+        <div className="absolute z-40 pointer-events-none"
+             style={{left:draw.x,top:draw.y,width:draw.w,height:draw.h,border:'2px solid #dc2626',background:'rgba(220,38,38,0.12)',boxShadow:'0 0 0 9999px rgba(0,0,0,0.25)'}}>
+          {!draw.active && (
+            <div className="absolute pointer-events-auto flex gap-1" style={{top:'100%',right:0,marginTop:6}}>
+              <button onClick={confirmArea} disabled={extracting}
+                      className="bg-purple-600 hover:bg-purple-700 disabled:bg-slate-400 text-white text-[11px] font-bold px-3 py-1.5 rounded shadow-lg flex items-center gap-1 whitespace-nowrap">
+                {extracting ? <><span className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"/>抽出中...</> : <><Sparkles size={11}/>この範囲から抽出</>}
+              </button>
+              <button onClick={cancelArea} className="bg-slate-700 hover:bg-slate-800 text-white text-[11px] px-2 py-1.5 rounded shadow"><XCircle size={12}/></button>
+            </div>
+          )}
+        </div>
+      )}
+      <div className="absolute top-1.5 left-1.5 bg-black/60 text-white text-[9px] font-mono px-1.5 py-0.5 rounded-full z-20">P.{pageNum}</div>
+    </div>
+  );
 }
 
-function PdfViewer({ file, searchQuery, targetPage, onToast, scale }) {
+function PdfViewer({ file, searchQuery, targetPage, onToast, scale, selectionMode, onExtractFromSelection, extracting }) {
   const [pdf, setPdf] = useState(null); const [numPages, setNumPages] = useState(0);
+  // テキスト選択時のフローティングボタン
+  const [textSel, setTextSel] = useState(null); // {text, pageNum, x, y}
+
   useEffect(() => {
     if (!file) return; let d = false;
     file.arrayBuffer().then(buf => {
@@ -812,8 +899,66 @@ function PdfViewer({ file, searchQuery, targetPage, onToast, scale }) {
     return () => clearTimeout(timer);
   }, [searchQuery, scale]);
 
+  // テキスト選択リスナー（モード = 'text' のときのみ動作。既存の選択動作は壊さず、ボタンだけ追加表示）
+  useEffect(() => {
+    if (selectionMode !== 'text') { setTextSel(null); return; }
+    let timer;
+    const handler = () => {
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const sel = window.getSelection();
+        if (!sel || sel.isCollapsed) { setTextSel(null); return; }
+        const text = sel.toString().trim();
+        if (text.length < 10) { setTextSel(null); return; }
+        const range = sel.getRangeAt(0);
+        const node = range.commonAncestorContainer;
+        const tlEl = (node.nodeType === 1 ? node : node.parentElement)?.closest?.('.textLayer');
+        if (!tlEl) { setTextSel(null); return; }
+        const pageEl = tlEl.closest('[id^="pdf-page-"]');
+        const pageNum = pageEl ? parseInt(pageEl.id.replace('pdf-page-', '')) : null;
+        const rect = range.getBoundingClientRect();
+        setTextSel({ text, pageNum, x: rect.left + rect.width / 2, y: rect.bottom });
+      }, 250);
+    };
+    document.addEventListener('selectionchange', handler);
+    return () => { document.removeEventListener('selectionchange', handler); clearTimeout(timer); };
+  }, [selectionMode]);
+
+  const handleAreaSelect = ({ pageNum, image }) => {
+    onExtractFromSelection && onExtractFromSelection({ type: 'image', image, pageNum });
+  };
+  const handleTextExtract = () => {
+    if (!textSel) return;
+    onExtractFromSelection && onExtractFromSelection({ type: 'text', text: textSel.text, pageNum: textSel.pageNum });
+    setTextSel(null);
+    try { window.getSelection().removeAllRanges(); } catch (e) {}
+  };
+
   if (!pdf) return <div className="flex h-full items-center justify-center text-slate-400"><span className="animate-spin h-5 w-5 border-2 border-slate-300 border-t-blue-500 rounded-full mr-2"/>PDF読込中...</div>;
-  return (<div className="absolute top-0 left-0 min-w-full p-3 flex flex-col items-center pb-20">{Array.from({ length: numPages }, (_, i) => <PdfPage key={i+1} pdf={pdf} pageNum={i+1} scale={scale}/>)}</div>);
+  return (
+    <>
+      <div className="absolute top-0 left-0 min-w-full p-3 flex flex-col items-center pb-20">
+        {Array.from({ length: numPages }, (_, i) => (
+          <PdfPage key={i+1} pdf={pdf} pageNum={i+1} scale={scale}
+                   selectionMode={selectionMode}
+                   onAreaSelect={handleAreaSelect}
+                   extracting={extracting}/>
+        ))}
+      </div>
+      {/* テキスト選択時のフローティング抽出ボタン */}
+      {selectionMode === 'text' && textSel && (
+        <div className="fixed z-50 flex gap-1 fade-in-up"
+             style={{ left: Math.max(8, Math.min(textSel.x - 90, window.innerWidth - 200)), top: textSel.y + 8 }}>
+          <button onClick={handleTextExtract} disabled={extracting}
+                  className="bg-purple-600 hover:bg-purple-700 disabled:bg-slate-400 text-white text-xs font-bold px-3 py-2 rounded-lg shadow-xl flex items-center gap-1.5 ring-2 ring-purple-300">
+            {extracting ? <><span className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"/>抽出中</> : <><Sparkles size={12}/>選択箇所を抽出</>}
+          </button>
+          <button onClick={() => { setTextSel(null); try { window.getSelection().removeAllRanges(); } catch (e) {} }}
+                  className="bg-slate-700 hover:bg-slate-800 text-white text-xs px-2 py-2 rounded-lg shadow-xl"><XCircle size={12}/></button>
+        </div>
+      )}
+    </>
+  );
 }
 
 /* ============================================================
@@ -1133,7 +1278,7 @@ function ConfidenceBadge({ confidence }) {
   return <span className={`text-[8px] font-bold px-1 py-0.5 rounded border ${cls}`} title={`信頼度: ${confidence}`}>信{labels[confidence] || '?'}</span>;
 }
 
-function OutcomeCard({ oc, idx, pico, onEdit, onCopyTSV, onCopyCSV, onHighlight, onSendToSearch, onReVerify, fontSize }) {
+function OutcomeCard({ oc, idx, pico, onEdit, onCopyTSV, onCopyCSV, onHighlight, onSendToSearch, onReVerify, fontSize, isNew }) {
   const isAuto = oc.requestedOutcomeName?.includes("未指定") || oc.requestedOutcomeName?.includes("自動");
   const has3rd = !!(oc.thirdGroup || oc.thirdGroupName);
   const EditCell = ({ group, field, cls = "" }) => {
@@ -1161,7 +1306,12 @@ function OutcomeCard({ oc, idx, pico, onEdit, onCopyTSV, onCopyCSV, onHighlight,
   const allEmpty = filledI + filledC === 0 && !hasEffect;
 
   return (
-    <div className={`border rounded-lg overflow-hidden shadow-sm ${isAuto?'border-amber-200':'border-slate-200'}`}>
+    <div id={`outcome-card-${idx}`} className={`border rounded-lg overflow-hidden shadow-sm transition-all ${isNew ? 'border-purple-500 ring-4 ring-purple-300 shadow-xl' : isAuto?'border-amber-200':'border-slate-200'} ${oc._addedFromSelection ? 'border-l-4 border-l-purple-500' : ''}`}>
+      {oc._addedFromSelection && (
+        <div className="bg-purple-100 text-purple-900 text-[10px] font-bold px-3 py-1 border-b border-purple-200 flex items-center gap-1">
+          <Sparkles size={11}/>PDF選択範囲から追加抽出
+        </div>
+      )}
       <div className={`${isAuto?'bg-amber-50':'bg-slate-50'} px-3 py-2 border-b border-slate-200`}>
         <div className="flex flex-wrap items-center justify-between gap-2">
           <div className="flex-1 min-w-0">
@@ -1936,6 +2086,82 @@ function ExtractorPage({ apiKeys, model, onBack }) {
     }
   };
 
+  // PDF の選択範囲（文字 or 画像）から1アウトカムを抽出して既存リストに追加
+  const [pdfSelectionMode, setPdfSelectionMode] = useState('text'); // 'text' or 'area'
+  const [extractingFromSelection, setExtractingFromSelection] = useState(false);
+  const [highlightNewIdx, setHighlightNewIdx] = useState(null);
+
+  const extractFromSelection = async ({ type, text, image, pageNum }) => {
+    if (!apiKeys?.length) { showToast("APIキーが必要", "error"); return; }
+    if (extractingFromSelection) { showToast("抽出中です。完了をお待ちください", "info"); return; }
+    if (type === 'text' && (!text || text.trim().length < 10)) { showToast("選択テキストが短すぎます（10文字以上）", "error"); return; }
+    if (type === 'image' && !image) { showToast("画像が取得できませんでした", "error"); return; }
+
+    setExtractingFromSelection(true);
+    const modelInfo = GEMINI_MODELS.find(m => m.id === model) || GEMINI_MODELS[0];
+    // 画像抽出時、選択モデルがテキスト専用なら自動で Flash Lite に切替
+    const targetModel = (type === 'image' && modelInfo.textOnly) ? 'gemini-2.5-flash-lite' : model;
+    if (targetModel !== model) showToast(`📷 画像抽出のため ${targetModel} に切替`, 'info');
+
+    showToast(`🔍 選択範囲から抽出中...`, 'info');
+    try {
+      const rotator = makeKeyRotator(apiKeys);
+      const sysPrompt = `あなたは医学RCT論文のメタ分析データ抽出専門家です。提供された論文の${type === 'text' ? '選択テキスト' : '選択画像'}から、**1個のアウトカム**を抽出してください。
+JSON1個（配列でなく単一オブジェクト）だけを返答。マークダウン不要。
+evidenceText には選択された原文（${type === 'image' ? '画像から読取り、' : ''}改変禁止、120文字以内に要約抜粋可）を、evidenceTextJa にその日本語訳を入れてください。
+数値（n, 平均, SD, 効果量, P値）は必ず構造化フィールドに入れてください。`;
+
+      const userPrompt = type === 'text'
+        ? `【論文の選択箇所（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】\n${text}\n\n上記から1個のアウトカム（actualOutcomeName, interventionGroup/comparisonGroup の数値, effectEstimate, evidenceText, evidenceTextJa, sourceLocation, pageNumber=${pageNum||0}, confidence）を抽出。`
+        : `【論文画像（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】の選択範囲から1個のアウトカムを抽出。
+画像内の数値・表のセル・グラフ軸目盛り・KMカーブの値などを丁寧に読取り、構造化フィールドに転記してください。
+sourceLocation には "Figure X" や "Table Y" のように出処、pageNumber=${pageNum||0}, confidence は medium または low（目視抽出のため）。
+evidenceText には画像内の文字・数値を文字起こし。evidenceTextJa はその日本語訳。
+figureType に種別（"Table"/"BarChart"/"LineChart"/"KaplanMeier"/"ForestPlot"/"Boxplot"）を記録。`;
+
+      const newOutcome = await callGemini({
+        rotator,
+        model: targetModel,
+        systemPrompt: sysPrompt,
+        userText: userPrompt,
+        images: type === 'image' ? [{ inlineData: { data: image, mimeType: "image/jpeg" } }] : null,
+        pdfBase64: null,
+        schema: SINGLE_OUTCOME_SCHEMA_GEMINI,
+        thinkingBudget: 0,
+        onNotice: (m) => showToast(m, 'info')
+      });
+
+      if (!newOutcome || !newOutcome.actualOutcomeName) { throw new Error("有効なアウトカムが返されませんでした"); }
+
+      // 既存結果に追加
+      newOutcome.notes = (newOutcome.notes || '') + ` [${type === 'text' ? '📝選択テキスト' : '🔲選択範囲画像'}から追加抽出 P.${pageNum||'?'}]`;
+      newOutcome._addedFromSelection = true;
+      if (!newOutcome.pageNumber && pageNum) newOutcome.pageNumber = pageNum;
+
+      setResult(prev => {
+        const base = prev || { extractedOutcomes: [], paperPICO: {}, statisticalMethods: [], unclearItems: [] };
+        const nr = { ...base };
+        nr.extractedOutcomes = [...(nr.extractedOutcomes || []), newOutcome];
+        const newIdx = nr.extractedOutcomes.length - 1;
+        // ハイライト用にインデックス記録（3秒で消す）
+        setTimeout(() => setHighlightNewIdx(null), 3000);
+        setHighlightNewIdx(newIdx);
+        // 新カードへスクロール
+        setTimeout(() => {
+          const el = document.getElementById(`outcome-card-${newIdx}`);
+          if (el) el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }, 100);
+        return nr;
+      });
+      showToast(`✅ 「${newOutcome.actualOutcomeName}」を追加`, 'success');
+    } catch (e) {
+      console.error(e);
+      showToast(`抽出失敗: ${e.message}`, 'error');
+    } finally {
+      setExtractingFromSelection(false);
+    }
+  };
+
   // 1アウトカムだけを再抽出（数値強化プロンプト）
   const reVerifyOutcome = async (idx) => {
     if (!apiKeys?.length) { showToast("再抽出にはAPIキーが必要", "error"); return; }
@@ -2305,7 +2531,8 @@ ${pdfText.substring(0, 30000)}`;
                       onCopyTSV={copyOneTSV} onCopyCSV={copyOneCSV} fontSize={leftFontSize}
                       onHighlight={(o) => { setHlQuery(o.evidenceText); setHlPage(o.pageNumber); setPdfSearchText(o.evidenceText || ""); }}
                       onSendToSearch={sendToSearch}
-                      onReVerify={apiKeys?.length ? reVerifyOutcome : null}/>
+                      onReVerify={apiKeys?.length ? reVerifyOutcome : null}
+                      isNew={highlightNewIdx === idx}/>
                   ))}
                   {(!result.extractedOutcomes?.length) && <div className="text-center py-6 text-slate-500">データなし</div>}
                 </div>
@@ -2342,9 +2569,21 @@ ${pdfText.substring(0, 30000)}`;
             </div>
 
             <div className="w-full xl:w-[45%] h-full flex flex-col bg-slate-200 rounded-lg border border-slate-300 shadow-inner overflow-hidden relative split-pane">
-              <div className="bg-slate-800 text-slate-200 text-[9px] px-2 py-1.5 flex items-center justify-between z-10 flex-shrink-0">
-                <span className="flex items-center gap-1 font-mono truncate max-w-[35%]"><FileText size={11}/>{pdfFile?.name}</span>
-                <div className="flex items-center gap-1.5">
+              <div className="bg-slate-800 text-slate-200 text-[9px] px-2 py-1.5 flex items-center justify-between z-10 flex-shrink-0 gap-2">
+                <span className="flex items-center gap-1 font-mono truncate max-w-[25%]"><FileText size={11}/>{pdfFile?.name}</span>
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  {/* 選択モード切替 */}
+                  <div className="flex items-center gap-0.5 bg-slate-700 p-0.5 rounded" title="PDF上で選択して、その部分から AIに再抽出させる">
+                    <button onClick={() => setPdfSelectionMode('text')}
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 transition ${pdfSelectionMode === 'text' ? 'bg-purple-600 text-white' : 'text-slate-300 hover:bg-slate-600'}`}>
+                      <TypeIcon size={10}/>テキスト選択
+                    </button>
+                    <button onClick={() => setPdfSelectionMode('area')}
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 transition ${pdfSelectionMode === 'area' ? 'bg-purple-600 text-white' : 'text-slate-300 hover:bg-slate-600'}`}>
+                      <TargetIcon size={10}/>範囲選択
+                    </button>
+                  </div>
+                  {extractingFromSelection && <span className="bg-purple-600 text-white px-1.5 py-0.5 rounded font-bold text-[9px] flex items-center gap-1 animate-pulse"><Sparkles size={9}/>抽出中</span>}
                   {hlQuery ? <span className="bg-yellow-400 text-yellow-900 px-1 py-0.5 rounded font-bold text-[8px] animate-pulse">HL</span> : null}
                   <div className="flex items-center gap-0.5 bg-slate-700 p-0.5 rounded">
                     <button onClick={() => setPdfScale(s => Math.max(0.4, s-0.2))} className="p-0.5 hover:bg-slate-500 rounded text-slate-300"><ZoomOutIcon size={11}/></button>
@@ -2352,6 +2591,13 @@ ${pdfText.substring(0, 30000)}`;
                     <button onClick={() => setPdfScale(s => Math.min(3, s+0.2))} className="p-0.5 hover:bg-slate-500 rounded text-slate-300"><ZoomInIcon size={11}/></button>
                   </div>
                 </div>
+              </div>
+
+              {/* モード説明バー */}
+              <div className={`px-2 py-1 text-[10px] flex items-center gap-1.5 border-b ${pdfSelectionMode === 'area' ? 'bg-purple-100 border-purple-300 text-purple-900' : 'bg-blue-50 border-blue-200 text-blue-900'}`}>
+                {pdfSelectionMode === 'area'
+                  ? <><TargetIcon size={11}/><b>範囲選択モード:</b> PDF上でマウスドラッグして矩形を描く → 「この範囲から抽出」ボタンで AI が画像から1アウトカム追加</>
+                  : <><TypeIcon size={11}/><b>テキスト選択モード:</b> PDF上の文章を選ぶ → 浮かぶ「選択箇所を抽出」ボタンで AI が1アウトカム追加（既存検索動作も維持）</>}
               </div>
 
               <div className="bg-slate-700 px-2 py-1.5 flex items-center gap-1.5 z-10 flex-shrink-0 border-b border-slate-600">
@@ -2365,7 +2611,10 @@ ${pdfText.substring(0, 30000)}`;
               </div>
 
               <div className="flex-1 overflow-auto relative bg-slate-300">
-                <PdfViewer file={pdfFile} searchQuery={hlQuery} targetPage={hlPage} onToast={showToast} scale={pdfScale}/>
+                <PdfViewer file={pdfFile} searchQuery={hlQuery} targetPage={hlPage} onToast={showToast} scale={pdfScale}
+                  selectionMode={pdfSelectionMode}
+                  onExtractFromSelection={extractFromSelection}
+                  extracting={extractingFromSelection}/>
               </div>
             </div>
           </div>
