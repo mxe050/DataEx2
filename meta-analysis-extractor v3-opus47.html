@@ -801,6 +801,25 @@ function PdfPage({ pdf, pageNum, scale, selectionMode, onAreaSelect, extracting 
   const overlayRef = useRef(null);
   // 範囲選択の描画状態
   const [draw, setDraw] = useState(null); // {sx,sy,x,y,w,h,active}
+  // Shift キーで一時的に範囲選択モード化
+  const [shiftHeld, setShiftHeld] = useState(false);
+
+  useEffect(() => {
+    const onKey = (e) => { if (e.key === 'Shift') setShiftHeld(e.type === 'keydown'); };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('keyup', onKey);
+    // フォーカスが外れたときも解除
+    const onBlur = () => setShiftHeld(false);
+    window.addEventListener('blur', onBlur);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('keyup', onKey);
+      window.removeEventListener('blur', onBlur);
+    };
+  }, []);
+
+  // 実効モード: モード設定 が area か、または Shift 押下中 → area 扱い
+  const effectiveAreaMode = selectionMode === 'area' || shiftHeld;
 
   useEffect(() => {
     let task;
@@ -822,7 +841,7 @@ function PdfPage({ pdf, pageNum, scale, selectionMode, onAreaSelect, extracting 
 
   // 範囲選択ハンドラ
   const onMouseDown = (e) => {
-    if (selectionMode !== 'area') return;
+    if (!effectiveAreaMode) return;
     e.preventDefault();
     const r = overlayRef.current.getBoundingClientRect();
     const sx = e.clientX - r.left, sy = e.clientY - r.top;
@@ -859,21 +878,24 @@ function PdfPage({ pdf, pageNum, scale, selectionMode, onAreaSelect, extracting 
 
   const cancelArea = () => setDraw(null);
 
-  // テキスト選択を妨げないように pointerEvents を制御
-  const overlayPE = selectionMode === 'area' ? 'auto' : 'none';
-
   return (
     <div id={`pdf-page-${pageNum}`} className="bg-white shadow-lg relative rounded overflow-hidden flex-shrink-0 mx-auto mb-4" style={{width:w}}>
       <canvas ref={canvasRef} className="block"/>
-      <div ref={textRef} className="textLayer" style={{pointerEvents: selectionMode === 'area' ? 'none' : 'auto'}}/>
+      <div ref={textRef} className="textLayer" style={{pointerEvents: effectiveAreaMode ? 'none' : 'auto', userSelect: effectiveAreaMode ? 'none' : 'text'}}/>
       {/* 範囲選択オーバーレイ */}
       <div ref={overlayRef}
-           className={`absolute inset-0 z-30 ${selectionMode === 'area' ? 'cursor-crosshair' : ''}`}
-           style={{pointerEvents: overlayPE}}
+           className={`absolute inset-0 z-30 ${effectiveAreaMode ? 'cursor-crosshair' : ''}`}
+           style={{pointerEvents: effectiveAreaMode ? 'auto' : 'none'}}
            onMouseDown={onMouseDown}
            onMouseMove={onMouseMove}
            onMouseUp={onMouseUp}
            onMouseLeave={onMouseUp}/>
+      {/* Shift 押下中のヒント表示（テキスト選択モード時） */}
+      {shiftHeld && selectionMode === 'text' && (
+        <div className="absolute top-2 right-2 z-40 bg-purple-600 text-white text-[10px] font-bold px-2 py-1 rounded-full shadow-lg pointer-events-none flex items-center gap-1 animate-pulse">
+          <TargetIcon size={10}/>範囲選択モード (Shift)
+        </div>
+      )}
       {/* 描画中の矩形 */}
       {draw && (
         <div className="absolute z-40 pointer-events-none"
@@ -881,10 +903,10 @@ function PdfPage({ pdf, pageNum, scale, selectionMode, onAreaSelect, extracting 
           {!draw.active && (
             <div className="absolute pointer-events-auto flex gap-1" style={{top:'100%',right:0,marginTop:6}}>
               <button onClick={confirmArea} disabled={extracting}
-                      className="bg-purple-600 hover:bg-purple-700 disabled:bg-slate-400 text-white text-[11px] font-bold px-3 py-1.5 rounded shadow-lg flex items-center gap-1 whitespace-nowrap">
-                {extracting ? <><span className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"/>抽出中...</> : <><Sparkles size={11}/>この範囲から抽出</>}
+                      className="bg-purple-600 hover:bg-purple-700 disabled:bg-slate-400 text-white text-[12px] font-bold px-3 py-2 rounded-lg shadow-xl flex items-center gap-1.5 whitespace-nowrap ring-2 ring-purple-300">
+                {extracting ? <><span className="animate-spin h-3 w-3 border-2 border-white border-t-transparent rounded-full"/>抽出中...</> : <><Sparkles size={12}/>この範囲から抽出</>}
               </button>
-              <button onClick={cancelArea} className="bg-slate-700 hover:bg-slate-800 text-white text-[11px] px-2 py-1.5 rounded shadow"><XCircle size={12}/></button>
+              <button onClick={cancelArea} title="キャンセル" className="bg-slate-700 hover:bg-slate-800 text-white text-[12px] px-2.5 py-2 rounded-lg shadow"><XCircle size={13}/></button>
             </div>
           )}
         </div>
@@ -2609,17 +2631,17 @@ ${pdfText.substring(0, 30000)}`;
 
             <div className="w-full xl:w-[45%] h-full flex flex-col bg-slate-200 rounded-lg border border-slate-300 shadow-inner overflow-hidden relative split-pane">
               <div className="bg-slate-800 text-slate-200 text-[9px] px-2 py-1.5 flex items-center justify-between z-10 flex-shrink-0 gap-2">
-                <span className="flex items-center gap-1 font-mono truncate max-w-[25%]"><FileText size={11}/>{pdfFile?.name}</span>
+                <span className="flex items-center gap-1 font-mono truncate max-w-[20%]"><FileText size={11}/>{pdfFile?.name}</span>
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  {/* 選択モード切替 */}
-                  <div className="flex items-center gap-0.5 bg-slate-700 p-0.5 rounded" title="PDF上で選択して、その部分から AIに再抽出させる">
+                  {/* 選択モード切替（大型・色分け） */}
+                  <div className="flex items-center gap-0 bg-slate-900 p-1 rounded-lg shadow-inner ring-1 ring-slate-600" title="文章 = テキストモード／図・表・グラフ = 範囲モード">
                     <button onClick={() => setPdfSelectionMode('text')}
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 transition ${pdfSelectionMode === 'text' ? 'bg-purple-600 text-white' : 'text-slate-300 hover:bg-slate-600'}`}>
-                      <TypeIcon size={10}/>テキスト選択
+                            className={`px-2.5 py-1 rounded text-[11px] font-bold flex items-center gap-1 transition-all ${pdfSelectionMode === 'text' ? 'bg-blue-500 text-white shadow' : 'text-slate-400 hover:bg-slate-700'}`}>
+                      <TypeIcon size={12}/>📝 文章選択
                     </button>
                     <button onClick={() => setPdfSelectionMode('area')}
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold flex items-center gap-0.5 transition ${pdfSelectionMode === 'area' ? 'bg-purple-600 text-white' : 'text-slate-300 hover:bg-slate-600'}`}>
-                      <TargetIcon size={10}/>範囲選択
+                            className={`px-2.5 py-1 rounded text-[11px] font-bold flex items-center gap-1 transition-all ${pdfSelectionMode === 'area' ? 'bg-purple-500 text-white shadow' : 'text-slate-400 hover:bg-slate-700'}`}>
+                      <TargetIcon size={12}/>🔲 図・表選択
                     </button>
                   </div>
                   {extractingFromSelection && <span className="bg-purple-600 text-white px-1.5 py-0.5 rounded font-bold text-[9px] flex items-center gap-1 animate-pulse"><Sparkles size={9}/>抽出中</span>}
@@ -2632,11 +2654,19 @@ ${pdfText.substring(0, 30000)}`;
                 </div>
               </div>
 
-              {/* モード説明バー */}
-              <div className={`px-2 py-1 text-[10px] flex items-center gap-1.5 border-b ${pdfSelectionMode === 'area' ? 'bg-purple-100 border-purple-300 text-purple-900' : 'bg-blue-50 border-blue-200 text-blue-900'}`}>
-                {pdfSelectionMode === 'area'
-                  ? <><TargetIcon size={11}/><b>範囲選択モード:</b> PDF上でマウスドラッグして矩形を描く → 「この範囲から抽出」ボタンで AI が画像から1アウトカム追加</>
-                  : <><TypeIcon size={11}/><b>テキスト選択モード:</b> PDF上の文章を選ぶ → 浮かぶ「選択箇所を抽出」ボタンで AI が1アウトカム追加（既存検索動作も維持）</>}
+              {/* モード説明バー（図・表モードは強調色） */}
+              <div className={`px-3 py-1.5 text-[11px] flex items-center gap-2 border-b ${pdfSelectionMode === 'area' ? 'bg-purple-100 border-purple-400 text-purple-900' : 'bg-blue-50 border-blue-300 text-blue-900'}`}>
+                {pdfSelectionMode === 'area' ? (
+                  <>
+                    <TargetIcon size={14} className="text-purple-700"/>
+                    <span><b>🔲 図・表選択モード:</b> PDF上で<b>マウスをドラッグ</b>して図・表を囲む → 「この範囲から抽出」ボタンで AI が画像から1アウトカム抽出 → カードに追加</span>
+                  </>
+                ) : (
+                  <>
+                    <TypeIcon size={14} className="text-blue-700"/>
+                    <span><b>📝 文章選択モード:</b> PDF文章を選ぶ → 「選択箇所を抽出」ボタン。<b className="bg-purple-200 text-purple-900 px-1 rounded">図・表は左の「🔲図・表選択」に切替か、Shiftキー押しながらドラッグ</b></span>
+                  </>
+                )}
               </div>
 
               <div className="bg-slate-700 px-2 py-1.5 flex items-center gap-1.5 z-10 flex-shrink-0 border-b border-slate-600">
