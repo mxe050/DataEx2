@@ -432,12 +432,12 @@ const CRITIC_SCHEMA = {
 // ※ Gemini 2.5 Flash 系は RPD=20/日と厳しいが、マルチモーダル対応
 // ※ Gemini 2.5 Pro は無料枠なし（Billing 有効化必要）
 // maxOut は各モデルの最大出力トークン数（公式 API 上限）
-// Gemma は 8K と小さいため、応答が切り詰められやすい → プロンプト側で簡潔さを強制
+// Gemma 3 (4B/12B/27B) は実は画像対応！ ただし出力 8K と小さいため要・サイズ制約
 const GEMINI_MODELS = [
-  { id: "gemma-3-27b-it",        name: "Gemma 3 27B (推奨/テキスト主体)",   thinking: false, supportsSchema: false, textOnly: true,  rpm: 30, rpd: 14400, tpm: 15000,  maxOut: 8192,  tag: "推奨", note: "無料枠14,400/日。PDFテキストから抽出。図表は不可・出力上限8K" },
-  { id: "gemma-3-12b-it",        name: "Gemma 3 12B (軽量・大量処理)",      thinking: false, supportsSchema: false, textOnly: true,  rpm: 30, rpd: 14400, tpm: 15000,  maxOut: 8192,  tag: "高速", note: "やや軽量。テキスト専用・出力上限8K" },
-  { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite (図表対応)",  thinking: false, supportsSchema: true,  textOnly: false, rpm: 10, rpd: 20,    tpm: 250000, maxOut: 64000, tag: "図表対応", note: "図・グラフも抽出。無料は20/日のみ・出力64K" },
-  { id: "gemini-2.5-flash",      name: "Gemini 2.5 Flash (品質最高/限定)",  thinking: true,  supportsSchema: true,  textOnly: false, rpm: 5,  rpd: 20,    tpm: 250000, maxOut: 65536, tag: "高品質", note: "高品質だが無料20/日かつRPM 5で詰まりやすい" },
+  { id: "gemma-3-27b-it",        name: "Gemma 3 27B (推奨/14,400/日)",      thinking: false, supportsSchema: false, textOnly: false, rpm: 30, rpd: 14400, tpm: 15000,  maxOut: 8192,  tag: "推奨", note: "無料枠が圧倒的(14,400/日)。画像対応・出力8K" },
+  { id: "gemma-3-12b-it",        name: "Gemma 3 12B (軽量・大量処理)",      thinking: false, supportsSchema: false, textOnly: false, rpm: 30, rpd: 14400, tpm: 15000,  maxOut: 8192,  tag: "高速", note: "やや軽量・画像対応・出力8K" },
+  { id: "gemini-2.5-flash-lite", name: "Gemini 2.5 Flash Lite (図表/JSON厳密)", thinking: false, supportsSchema: true, textOnly: false, rpm: 10, rpd: 20,    tpm: 250000, maxOut: 64000, tag: "JSON厳密", note: "JSON Schema厳守。無料は20/日のみ・出力64K" },
+  { id: "gemini-2.5-flash",      name: "Gemini 2.5 Flash (高品質/限定)",    thinking: true,  supportsSchema: true,  textOnly: false, rpm: 5,  rpd: 20,    tpm: 250000, maxOut: 65536, tag: "高品質", note: "高品質だが無料20/日かつRPM 5で詰まりやすい" },
   { id: "gemini-2.5-pro",        name: "Gemini 2.5 Pro (要・有料設定)",     thinking: true,  supportsSchema: true,  textOnly: false, rpm: 5,  rpd: 0,     tpm: 250000, maxOut: 65536, tag: "有料", paid: true, note: "無料枠なし。Billing有効化で利用可" }
 ];
 
@@ -717,6 +717,21 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       // 不正リクエスト等もリトライ不可
       if (r.kind === 'fatal') throw lastErr;
 
+      // レート制限: 長期 (retry-after > 20s) または日次クォータ枯渇なら即フォールバック
+      const isDailyQuota = /per.?day|RPD|requests.?per.?day|daily/i.test(r.message);
+      const longWait = r.retryAfterSec > 20;
+      if (r.kind === 'ratelimit') {
+        if ((isDailyQuota || longWait) && mIdx < modelChain.length - 1) {
+          notice(`⏳ ${tryModel} ${isDailyQuota ? '日次クォータ枯渇' : `レート制限 (${r.retryAfterSec}秒待機要)`} → 別モデルに切替`);
+          break;
+        }
+        // 短期レート制限でも 2 回試したら次モデルへ（無駄な待機を避ける）
+        if (attempt >= 1 && mIdx < modelChain.length - 1) {
+          notice(`⏳ ${tryModel} レート制限継続 → 別モデルに切替`);
+          break;
+        }
+      }
+
       if (r.kind === 'overloaded') {
         consecutiveOverload++;
         // 同モデルで 2 回連続 503 → フォールバックモデルへ
@@ -725,14 +740,20 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
         consecutiveOverload = 0;
       }
 
-      // 待機してリトライ
-      const waitMs = backoffMs(attempt, r.kind, r.retryAfterSec);
+      // 待機してリトライ（最終モデル時のみ長く待つ）
+      const isLastModel = mIdx >= modelChain.length - 1;
+      let waitMs = backoffMs(attempt, r.kind, r.retryAfterSec);
+      if (!isLastModel) waitMs = Math.min(waitMs, 8000); // フォールバック余地ありなら短く
       notice(`${r.kind === 'overloaded' ? '🔁 503 過負荷' : r.kind === 'ratelimit' ? '⏳ レート制限' : '🔁 再試行'} (${tryModel}) → ${Math.round(waitMs/1000)}秒待機 [${attempt+1}/${maxAttempts}]`);
       await sleep(waitMs);
     }
   }
 
-  throw lastErr || new Error("Gemini呼び出しに失敗");
+  // 全モデル試行後の失敗 → ヒント付きエラー
+  const hint = hasMedia
+    ? `\n\n💡 ヒント:\n・全マルチモーダルモデルが日次上限近く → 翌日(UTC0時/日本朝9時)まで待機\n・別Googleプロジェクトで2個目のキー作成 → 複数キー登録で枠を実質拡張\n・テキスト主体なら範囲モードを解除して通常抽出（Gemma 3 27B = 14,400/日）`
+    : `\n\n💡 ヒント:\n・複数キー登録で枠を実質拡張\n・別モデルへ手動切替`;
+  throw (lastErr ? new Error(lastErr.message + hint) : new Error("Gemini呼び出しに失敗" + hint));
 }
 
 // 統一インターフェイス（互換のため残す。今は Gemini のみ）
