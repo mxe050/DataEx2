@@ -628,10 +628,15 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
     if (mIdx > 0) notice(`⚠️ ${model} が混雑のため ${tryModel} に切替`);
 
     // モデルごとにリクエストボディを構築
-    // - Gemma: textOnly → 画像/PDFは送らない、schemaも非対応
-    // - Gemini: マルチモーダル → 画像/PDF送信可、schema対応
+    // - Gemma: textOnly + systemInstruction 非対応 → systemPrompt をユーザーメッセージに統合
+    // - Gemini: マルチモーダル + systemInstruction 対応 → 通常通り
     const isMultimodal = !modelInfo.textOnly;
-    const parts = [{ text: userText }];
+    const isGemma = /^gemma/i.test(tryModel);
+    const effectiveUserText = isGemma
+      ? `${systemPrompt}\n\n---\n\n【ユーザー指示】\n${userText}`
+      : userText;
+
+    const parts = [{ text: effectiveUserText }];
     if (isMultimodal) {
       if (pdfBase64 && /gemini/.test(tryModel)) {
         parts.push({ inlineData: { data: pdfBase64, mimeType: "application/pdf" } });
@@ -651,11 +656,15 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       genConfig.thinkingConfig = { thinkingBudget };
     }
 
-    const body = JSON.stringify({
+    const requestBody = {
       contents: [{ role: "user", parts }],
-      systemInstruction: { parts: [{ text: systemPrompt }] },
       generationConfig: genConfig
-    });
+    };
+    // Gemma は systemInstruction 非対応 → 上で統合済み、フィールド自体を送らない
+    if (!isGemma) {
+      requestBody.systemInstruction = { parts: [{ text: systemPrompt }] };
+    }
+    const body = JSON.stringify(requestBody);
 
     // 各モデルで最大 5 周（キーをローテートしながら）
     const maxAttempts = Math.max(5, keys.length * 2);
