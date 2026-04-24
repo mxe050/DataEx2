@@ -2053,8 +2053,14 @@ function SetupPage({ onComplete, initialConfig }) {
     if (legacy) return [legacy];
     return [""];
   })();
+  // モデル: localStorage に古い無効ID（gemma 等）が残っている場合は default にフォールバック
+  const initialModel = (() => {
+    const cached = initialConfig.model || initialConfig.providers?.gemini?.model;
+    if (cached && GEMINI_MODELS.find(m => m.id === cached)) return cached;
+    return GEMINI.defaultModel;
+  })();
   const [apiKeys, setApiKeys] = useState(initialKeys);
-  const [model, setModel] = useState(initialConfig.model || initialConfig.providers?.gemini?.model || GEMINI.defaultModel);
+  const [model, setModel] = useState(initialModel);
   const [verifyState, setVerifyState] = useState({});
   const [saveKeys, setSaveKeys] = useState(initialConfig.saveKeys !== false);
 
@@ -2080,11 +2086,13 @@ function SetupPage({ onComplete, initialConfig }) {
   };
 
   const handleStart = () => {
+    // 保存前に再度検証（無効ID防止）
+    const validatedModel = GEMINI_MODELS.find(m => m.id === model) ? model : GEMINI.defaultModel;
     const cfg = saveKeys
-      ? { apiKeys: validKeys, model, saveKeys }
-      : { apiKeys: [], model, saveKeys };
+      ? { apiKeys: validKeys, model: validatedModel, saveKeys }
+      : { apiKeys: [], model: validatedModel, saveKeys };
     saveConfig(cfg);
-    onComplete({ apiKeys: validKeys, model });
+    onComplete({ apiKeys: validKeys, model: validatedModel });
   };
 
   return (
@@ -2849,8 +2857,10 @@ function App() {
   const [initialConfig] = useState(() => loadConfig());
 
   const handleSetupComplete = ({ apiKeys, model }) => {
+    // 二重防御: 無効モデルIDが渡された場合はデフォルトに戻す
+    const validModel = GEMINI_MODELS.find(m => m.id === model) ? model : GEMINI.defaultModel;
     setApiKeys(apiKeys);
-    setModel(model);
+    setModel(validModel);
     setPage("main");
   };
 
