@@ -633,8 +633,11 @@ async function singleFetch(url, options) {
   const quotaId = quotaViolation?.quotaId || '';
   const quotaMetric = quotaViolation?.quotaMetric || '';
   const fullQuotaInfo = `${quotaId} ${quotaMetric}`.toLowerCase();
-  // 日次 vs 分次 vs その他を厳密判定（quotaId に "PerDay" / "PerMinute" が含まれるかで判別）
-  const isDailyQuota = rateLimit && (/per.?day|requests.?per.?day|daily/i.test(fullQuotaInfo) || /per.?day|RPD|daily/i.test(msg));
+  // ラベルは "PerDay" だが retry-after が短い (≤5分) なら実態は短期バースト制限
+  // → Google の汎用 quotaId に騙されず、retry-after を真実とする
+  const labelSaysDaily = rateLimit && (/per.?day|requests.?per.?day|daily/i.test(fullQuotaInfo) || /per.?day|RPD|daily/i.test(msg));
+  const isDailyQuota = labelSaysDaily && (retryAfterSec === 0 || retryAfterSec > 300); // retry-after なし or 5分超 → 真の日次
+  const isShortBurst = labelSaysDaily && retryAfterSec > 0 && retryAfterSec <= 300;     // PerDay ラベル + 短期 retry → 一時的バースト制限
   const isTpmQuota = rateLimit && (/InputTokensPerMinute|InputTokensPerProject/i.test(fullQuotaInfo) || /TPM|tokens.?per.?minute|input.?tokens/i.test(msg));
   const isRpmQuota = rateLimit && (/GenerateContentRequestsPerMinute|RequestsPerMinute/i.test(fullQuotaInfo) || /RPM|requests.?per.?minute/i.test(msg));
 
@@ -662,7 +665,7 @@ async function singleFetch(url, options) {
     durationMs: Date.now() - t0
   });
 
-  return { ok: false, kind, status, message: `${status} ${msg}`.trim(), retryAfterSec, isDailyQuota, isTpmQuota, isRpmQuota, quotaId };
+  return { ok: false, kind, status, message: `${status} ${msg}`.trim(), retryAfterSec, isDailyQuota, isShortBurst, isTpmQuota, isRpmQuota, quotaId };
 }
 
 // 503/429 を加味した待機（ジッタ付き）
@@ -850,23 +853,23 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       if (r.kind === 'fatal') throw lastErr;
 
       // 429 のサブ種別判定（singleFetch から伝搬）
-      const isDailyQuota = !!r.isDailyQuota;     // 日次クォータ枯渇 → 翌日まで回復不可
+      const isDailyQuota = !!r.isDailyQuota;     // 真の日次クォータ枯渇 → 翌日まで回復不可
+      const isShortBurst = !!r.isShortBurst;     // ★ PerDay ラベルだが retry-after が短期 → 一時的バースト制限
       const isTpmQuota = !!r.isTpmQuota;          // TPM 超過 → 1分待てば回復
       const isRpmQuota = !!r.isRpmQuota;          // RPM 超過 → 1分待てば回復
-      const hasRealQuotaError = !!r.quotaId;     // ★ quotaId あり = Google のクォータシステムが反応 = 各リトライがクォータを消費
+      const hasRealQuotaError = !!r.quotaId;     // quotaId あり = Google のクォータシステムが反応
       const veryLongWait = r.retryAfterSec > 90;  // サーバー指定 > 90s → 別モデル推奨
       const isLastModel = mIdx >= modelChain.length - 1;
       const isUserSelected = mIdx === 0;          // ユーザーが選択したモデル
 
       if (r.kind === 'ratelimit') {
-        // ★ 日次クォータ枯渇 → リトライ無意味、即フォールバック or throw
+        // ★ 真の日次クォータ枯渇（retry-after なし or > 5分）→ フォールバック or throw
         if (isDailyQuota) {
           failureLog.push({ model: tryModel, reason: `日次クォータ枯渇 (${r.quotaId || 'PerDay'})`, recoverable: 'tomorrow' });
           if (!isLastModel) {
             notice(`📅 ${tryModel} 日次クォータ枯渇 → 別モデルに切替`);
             break;
           } else {
-            // 全モデルの状況を踏まえて正確なメッセージを構築
             const dailyExhausted = failureLog.filter(f => f.reason.includes('日次')).map(f => f.model);
             const otherFailures = failureLog.filter(f => !f.reason.includes('日次'));
             let errMsg = `❌ 抽出失敗\n\n`;
@@ -879,11 +882,25 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
           }
         }
 
-        // ★ 本物のクォータエラー (quotaId あり) → 同モデルでのリトライは Google のクォータを消費するだけで無駄
-        // 即フォールバックして他モデルを試す
-        if (hasRealQuotaError && !isLastModel) {
+        // ★ 短期バースト制限（PerDay ラベルだが retry-after 短期）
+        // → Google 指示通り待って **同モデルで再試行** する（フォールバックも同プロジェクト枠を共有するため切替えても効かない）
+        if (isShortBurst) {
+          // 1回だけ待ってリトライ。それでもダメなら throw
+          if (attempt >= 1) {
+            failureLog.push({ model: tryModel, reason: `短期バースト制限継続 (${r.retryAfterSec}秒)`, recoverable: 'wait' });
+            const sec = r.retryAfterSec;
+            throw new Error(`⏰ Google が短期スロットリング中（quotaId=${r.quotaId}）\n\n` +
+              `${tryModel} は ${sec}秒待機を指示しています。\n${attempt+1}回試行後も継続。\n\n` +
+              `💡 対処:\n・**${sec + 10}秒〜1分待ってから** 抽出を再実行してください\n` +
+              `・両モデルとも同じプロジェクトの無料枠を共有しているため、別モデルへの切替えは無効\n` +
+              `・別プロジェクトのキーを追加 or 課金有効化で根本回避`);
+          }
+          notice(`⏰ ${tryModel} 短期バースト制限 → Google指示の${r.retryAfterSec}秒待機後に同モデルで再試行（フォールバックは同枠共有で無効）`);
+          // wait + retry セクションへ進む（同モデル再試行）
+        } else if (hasRealQuotaError && !isLastModel) {
+          // ★ その他の本物クォータエラー（TPM/RPM など）→ 即フォールバック
           failureLog.push({ model: tryModel, reason: `${isTpmQuota ? 'TPM' : isRpmQuota ? 'RPM' : '短期'} クォータ制限 (${r.quotaId})`, recoverable: 'wait' });
-          notice(`⏸ ${tryModel} ${isTpmQuota ? 'TPM' : isRpmQuota ? 'RPM' : '短期'}クォータ制限 → 別モデルに切替（同モデル再試行はクォータ無駄消費のため）`);
+          notice(`⏸ ${tryModel} ${isTpmQuota ? 'TPM' : isRpmQuota ? 'RPM' : '短期'}クォータ制限 → 別モデルに切替`);
           break;
         }
 
@@ -927,20 +944,32 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
 
       // 待機してリトライ（待機時間を厳しく上限化：体感「動かない」感を排除）
       let waitMs = backoffMs(attempt, r.kind, r.retryAfterSec);
-      // 待機上限の決定方針:
+      // 短期バースト時は Google 指示秒を尊重（最大40秒まで）
+      // それ以外の上限決定方針:
       //   - ユーザー選択モデル(mIdx=0)はちゃんと粘る → 上限長め(15-25s)
       //   - フォールバック先(mIdx>0)は素早く回す → 上限短め(5-8s)
       //   - 最終モデルは最後の砦なので長め
-      const waitCap = r.kind === 'ratelimit'
-        ? (isLastModel ? 25000 : (isUserSelected ? 15000 : 5000))
-        : (isLastModel ? 12000 : (isUserSelected ? 8000 : 6000));
+      let waitCap;
+      if (isShortBurst) {
+        // Google が短期バーストとして 35 秒程度の待機を指示してきている → 指示通り待つ
+        waitCap = Math.min((r.retryAfterSec + 3) * 1000, 40000);
+      } else {
+        waitCap = r.kind === 'ratelimit'
+          ? (isLastModel ? 25000 : (isUserSelected ? 15000 : 5000))
+          : (isLastModel ? 12000 : (isUserSelected ? 8000 : 6000));
+      }
       waitMs = Math.min(waitMs, waitCap);
-      // 表示: フォールバック中なら「選択 → 試行中」を明示（ユーザーが「Lite表示」に困惑しないため）
+      // 表示: フォールバック中なら「選択 → 試行中」を明示
       const modelLabel = mIdx > 0 ? `${model}失敗 → ${tryModel}にフォールバック中` : tryModel;
       const kindLabel = r.kind === 'overloaded' ? '🔁 503 過負荷'
-        : r.kind === 'ratelimit' ? `⏳ レート制限${isTpmQuota ? '(TPM分次)' : isRpmQuota ? '(RPM分次)' : isDailyQuota ? '(RPD日次)' : ''}`
+        : r.kind === 'ratelimit'
+          ? (isShortBurst ? '⏰ 短期バースト制限'
+            : `⏳ レート制限${isTpmQuota ? '(TPM分次)' : isRpmQuota ? '(RPM分次)' : isDailyQuota ? '(RPD日次)' : ''}`)
         : '🔁 再試行';
-      const retryHint = r.retryAfterSec > 0 ? ` (Google指示${r.retryAfterSec}秒→${Math.round(waitMs/1000)}秒に短縮)` : '';
+      // 短期バースト時はサーバー指示秒尊重を明示
+      const retryHint = r.retryAfterSec > 0
+        ? (isShortBurst ? ` (Google指示${r.retryAfterSec}秒尊重)` : ` (Google指示${r.retryAfterSec}秒→${Math.round(waitMs/1000)}秒に短縮)`)
+        : '';
       notice(`${kindLabel} (${modelLabel})${retryHint} → ${Math.round(waitMs/1000)}秒待機 [${attempt+1}/${maxAttempts}]`);
       await sleep(waitMs);
     }
