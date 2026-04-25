@@ -2833,18 +2833,61 @@ Step 4 実行: 両方非空 ✓ → 出力 OK
 【鉄則】「どのアウトカム / どの時点 / どの解析集団（ITT/PP/safety等）/ どの分母 / どの統計量」を数字とセットで必ず記録。揃わない単独の数字は confidence="low" + notes に欠落項目を明記。`;
 
       const userPrompt = type === 'text'
-        ? `【論文の選択箇所（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】\n${text}\n\n上記から1個のアウトカム（actualOutcomeName, interventionGroup/comparisonGroup の数値, effectEstimate, evidenceText, evidenceTextJa, sourceLocation, pageNumber=${pageNum||0}, confidence）を抽出。
+        ? `【論文の選択箇所（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】
+${text}
 
-⚠ 重要: 上記テキスト内に「n=X」と「n=Y」のように **2セットの (n, 数値) が併記**されていれば、それは介入群と対照群の両方。必ず両方を interventionGroup と comparisonGroup に転記してください。片方を "未抽出"/"不明"/空 のままにしないこと。
-出力前に自己チェック: comparisonGroup.n_total と comparisonGroup.events_or_mean が両方埋まっているか? 埋まっていないなら、テキストを再精読して2セット目の数値を抽出してから返答。`
+【タスク】上記から1個のアウトカムを抽出。**介入群と対照群の両方**の数値を必ず埋める。
+選択箇所に「(n=X, 数値)」が 2 セット併記されていれば、それは2群（intervention vs control）。
+**フィールドを空のままにしない** — 不明なら "不明"、該当なしは "-" を記載。
+
+以下の JSON 形式で返答（マークダウン不要、両群とも全フィールド埋める）:
+{
+  "actualOutcomeName": "アウトカム名（時点を含めると良い）",
+  "timePoint": "時点（例: 5年, 24時間, 12週）",
+  "variableType": "Binary | Continuous | TimeToEvent",
+  "populationType": "ITT | mITT | PP | safety | 不明",
+  "interventionGroup": { "n_total": "X", "events_or_mean": "Y", "sd_or_se": "Z または -" },
+  "comparisonGroup":   { "n_total": "X", "events_or_mean": "Y", "sd_or_se": "Z または -" },
+  "effectEstimate":    { "measureType": "RR/OR/HR/MD/SMD/-", "value": "...", "ci95": "...", "pValue": "..." },
+  "evidenceText":      "選択原文をそのまま引用（120字以内）",
+  "evidenceTextJa":    "日本語訳",
+  "sourceLocation":    "選択範囲の出処",
+  "pageNumber":        ${pageNum||0},
+  "confidence":        "high | medium | low",
+  "notes":             ""
+}
+
+⚠ 出力直前の自己チェック（必須）:
+✓ interventionGroup.n_total と events_or_mean が両方非空か?
+✓ comparisonGroup.n_total と events_or_mean が両方非空か?（"未抽出" や 空文字列で出力するのは禁止。値が分からない場合のみ "不明" と記載）
+✓ 選択箇所に2セットの数値が見えるなら、両群とも実際の数値で埋まっているか?`
         : `【論文画像（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】の選択範囲から1個のアウトカムを抽出。
 画像内の数値・表のセル・グラフ軸目盛り・KMカーブの値などを丁寧に読取り、構造化フィールドに転記してください。
-sourceLocation には "Figure X" や "Table Y" のように出処、pageNumber=${pageNum||0}, confidence は medium または low（目視抽出のため）。
-evidenceText には画像内の文字・数値を文字起こし。evidenceTextJa はその日本語訳。
-figureType に種別（"Table"/"BarChart"/"LineChart"/"KaplanMeier"/"ForestPlot"/"Boxplot"）を記録。
+画像に**2列の表 / 2つのボックス / 2本の棒グラフ / 2つの群ラベル**のように2群分の数値が併記されていれば、必ず両方を interventionGroup と comparisonGroup に転記。
+**フィールドを空のままにしない** — 不明なら "不明"、該当なしは "-" を記載。
 
-⚠ 重要: 画像内に**2列の表 / 2つのボックス / 2本の棒グラフ / 2つの群ラベル**のように2群分の数値が併記されていれば、必ず両方を interventionGroup と comparisonGroup に転記。片方を "未抽出"/"不明"/空 のままにしないこと。
-出力前に自己チェック: comparisonGroup.n_total と comparisonGroup.events_or_mean が両方埋まっているか? 埋まっていないなら、画像を再精読して2群目の数値を抽出してから返答。`;
+以下の JSON 形式で返答（マークダウン不要、両群とも全フィールド埋める）:
+{
+  "actualOutcomeName": "アウトカム名（時点を含めると良い）",
+  "timePoint": "時点",
+  "variableType": "Binary | Continuous | TimeToEvent",
+  "populationType": "ITT | mITT | PP | safety | 不明",
+  "interventionGroup": { "n_total": "X", "events_or_mean": "Y", "sd_or_se": "Z または -" },
+  "comparisonGroup":   { "n_total": "X", "events_or_mean": "Y", "sd_or_se": "Z または -" },
+  "effectEstimate":    { "measureType": "RR/OR/HR/MD/SMD/-", "value": "...", "ci95": "...", "pValue": "..." },
+  "evidenceText":      "画像内の文字・数値を文字起こし（120字以内）",
+  "evidenceTextJa":    "日本語訳",
+  "sourceLocation":    "Figure X / Table Y 等",
+  "pageNumber":        ${pageNum||0},
+  "confidence":        "medium または low（目視抽出のため）",
+  "figureType":        "Table | BarChart | LineChart | KaplanMeier | ForestPlot | Boxplot | FlowDiagram",
+  "notes":             ""
+}
+
+⚠ 出力直前の自己チェック（必須）:
+✓ interventionGroup.n_total と events_or_mean が両方非空か?
+✓ comparisonGroup.n_total と events_or_mean が両方非空か?（"未抽出" や 空文字列で出力するのは禁止。値が分からない場合のみ "不明" と記載）
+✓ 画像に2群分の数値が見えるなら、両群とも実際の数値で埋まっているか?`;
 
       let actualModelUsed = targetModel;
       const newOutcome = await callGemini({
