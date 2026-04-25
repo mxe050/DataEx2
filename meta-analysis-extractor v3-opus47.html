@@ -549,7 +549,10 @@ async function callCriticAnyProvider(rotator, model, systemPrompt, userText, pdf
 }
 
 // fetch を1回だけ実行。リトライ可能性 (kind) と待機ヒント秒数 (retryAfterSec) を返す
+// url は診断ログ用にも参照される（key= 部分はマスク）
 async function singleFetch(url, options) {
+  // ★ 診断: 全リクエストを console に記録（ブラウザ DevTools で確認可能）
+  try { console.log(`[Gemini API →] ${url.replace(/key=[^&]+/, 'key=***')}`); } catch (e) {}
   let resp;
   try { resp = await fetch(url, options); }
   catch (e) {
@@ -587,9 +590,16 @@ async function singleFetch(url, options) {
   const rateLimit = status === 429;   // ★ 厳密に 429 のみ
   const auth = status === 401 || status === 403;
   const badReq = status === 400 || status === 404;
-  // 429 のサブ種別を判定（メッセージ内容から）
-  const isDailyQuota = rateLimit && /per.?day|RPD|requests.?per.?day|daily/i.test(msg);
-  const isTpmQuota = rateLimit && /TPM|tokens.?per.?minute|input.?tokens/i.test(msg);
+
+  // 429 のサブ種別とメタ情報を判定
+  const quotaViolation = body.error?.details?.find?.(d => d['@type']?.includes?.('QuotaFailure'))?.violations?.[0];
+  const quotaId = quotaViolation?.quotaId || '';
+  const quotaMetric = quotaViolation?.quotaMetric || '';
+  const fullQuotaInfo = `${quotaId} ${quotaMetric}`.toLowerCase();
+  // 日次 vs 分次 vs その他を厳密判定（quotaId に "PerDay" / "PerMinute" が含まれるかで判別）
+  const isDailyQuota = rateLimit && (/per.?day|requests.?per.?day|daily/i.test(fullQuotaInfo) || /per.?day|RPD|daily/i.test(msg));
+  const isTpmQuota = rateLimit && (/InputTokensPerMinute|InputTokensPerProject/i.test(fullQuotaInfo) || /TPM|tokens.?per.?minute|input.?tokens/i.test(msg));
+  const isRpmQuota = rateLimit && (/GenerateContentRequestsPerMinute|RequestsPerMinute/i.test(fullQuotaInfo) || /RPM|requests.?per.?minute/i.test(msg));
 
   let kind = 'fatal';
   if (auth) kind = 'auth';
@@ -599,7 +609,22 @@ async function singleFetch(url, options) {
   else if (badReq) kind = 'fatal';
   else kind = 'fatal';
 
-  return { ok: false, kind, status, message: `${status} ${msg}`.trim(), retryAfterSec, isDailyQuota, isTpmQuota };
+  // ★ 診断: コンソールに全 4xx/5xx を生で記録（ブラウザの DevTools で確認可能）
+  if (status >= 400) {
+    try {
+      console.warn(`[Gemini API ${status}] kind=${kind}`, {
+        url: url.replace(/key=[^&]+/, 'key=***'),
+        status,
+        msg,
+        retryAfterSec,
+        quotaId,
+        quotaMetric,
+        body
+      });
+    } catch (e) {}
+  }
+
+  return { ok: false, kind, status, message: `${status} ${msg}`.trim(), retryAfterSec, isDailyQuota, isTpmQuota, isRpmQuota, quotaId };
 }
 
 // 503/429 を加味した待機（ジッタ付き）
@@ -787,7 +812,8 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       // 429 のサブ種別判定（singleFetch から伝搬）
       const isDailyQuota = !!r.isDailyQuota;     // 日次クォータ枯渇 → 翌日まで回復不可
       const isTpmQuota = !!r.isTpmQuota;          // TPM 超過 → 1分待てば回復
-      const veryLongWait = r.retryAfterSec > 75;  // ★ サーバー指定 > 75s → さすがに別モデル推奨
+      const isRpmQuota = !!r.isRpmQuota;          // RPM 超過 → 1分待てば回復
+      const veryLongWait = r.retryAfterSec > 90;  // ★ サーバー指定 > 90s → さすがに別モデル推奨
       const isLastModel = mIdx >= modelChain.length - 1;
       const isUserSelected = mIdx === 0;          // ユーザーが選択したモデル（粘る価値あり）
 
@@ -795,21 +821,22 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
         // ★ 日次クォータ枯渇のみ早期throw / フォールバック（短期は粘る）
         if (isDailyQuota) {
           if (!isLastModel) {
-            notice(`⏳ ${tryModel} 日次クォータ枯渇 → 別モデルに切替`);
+            notice(`⏳ ${tryModel} 日次クォータ枯渇 (${r.quotaId || 'PerDay'}) → 別モデルに切替`);
             break;
           } else {
-            throw new Error(`全モデル (${modelChain.join(' / ')}) の日次クォータ枯渇。\n翌日(UTC0時/日本朝9時)まで待機 or 別プロジェクトのキーを追加してください。`);
+            throw new Error(`全モデル (${modelChain.join(' / ')}) の日次クォータ枯渇。\n翌日(UTC0時/日本朝9時)まで待機 or 別プロジェクトのキーを追加してください。\n[詳細: ${r.quotaId || r.message}]`);
           }
         }
-        // 超長期待機指示 (>75s) のみフォールバック（30s〜75s は粘って待つ価値あり）
+        // 超長期待機指示 (>90s) のみフォールバック（30s〜90s は粘って待つ価値あり）
         if (veryLongWait && !isLastModel) {
           notice(`⏳ ${tryModel} 超長期待機要 (${r.retryAfterSec}秒) → 別モデルに切替`);
           break;
         }
-        // 短期レート制限: ユーザー選択モデル（mIdx=0）は3回まで粘る、フォールバック先（mIdx>0）は2回で切替
-        const giveUpAt = isUserSelected ? 3 : 1;
+        // ★ ユーザー選択モデルは最低 attempt 0+1 の 2回試行を保証してから切替
+        // 即フォールバックを禁止することで、Google が retry-after=60s 程度を返してきても粘る
+        const giveUpAt = isUserSelected ? 3 : 2;
         if (attempt >= giveUpAt && !isLastModel) {
-          notice(`⏳ ${tryModel} ${isTpmQuota ? 'TPM超過' : 'レート制限'} 継続 → 別モデルに切替`);
+          notice(`⏳ ${tryModel} ${isTpmQuota ? 'TPM超過' : isRpmQuota ? 'RPM超過' : 'レート制限'} 継続 (${r.retryAfterSec}秒待機要) → 別モデルに切替`);
           break;
         }
         // ★ 最終モデルでも、短期 429 (TPM等) なら 4回まで粘る (待機累計 ≈55秒)
@@ -845,7 +872,11 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       waitMs = Math.min(waitMs, waitCap);
       // 表示: フォールバック中なら「選択 → 試行中」を明示（ユーザーが「Lite表示」に困惑しないため）
       const modelLabel = mIdx > 0 ? `${model}失敗 → ${tryModel}にフォールバック中` : tryModel;
-      notice(`${r.kind === 'overloaded' ? '🔁 503 過負荷' : r.kind === 'ratelimit' ? `⏳ レート制限${isTpmQuota ? '(TPM)' : isDailyQuota ? '(RPD)' : ''}` : '🔁 再試行'} (${modelLabel}) → ${Math.round(waitMs/1000)}秒待機 [${attempt+1}/${maxAttempts}]`);
+      const kindLabel = r.kind === 'overloaded' ? '🔁 503 過負荷'
+        : r.kind === 'ratelimit' ? `⏳ レート制限${isTpmQuota ? '(TPM分次)' : isRpmQuota ? '(RPM分次)' : isDailyQuota ? '(RPD日次)' : ''}`
+        : '🔁 再試行';
+      const retryHint = r.retryAfterSec > 0 ? ` (Google指示${r.retryAfterSec}秒→${Math.round(waitMs/1000)}秒に短縮)` : '';
+      notice(`${kindLabel} (${modelLabel})${retryHint} → ${Math.round(waitMs/1000)}秒待機 [${attempt+1}/${maxAttempts}]`);
       await sleep(waitMs);
     }
   }
