@@ -706,6 +706,8 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
 
   const notice = (msg) => { try { onNotice && onNotice(msg); } catch (e) {} };
   let lastErr = null;
+  // 各モデルの失敗理由を記録（最終 throw 時に正確に報告するため）
+  const failureLog = [];
 
   // 試すモデルの順序（最初は指定モデル → 503 で詰まれば fallback chain）
   // 画像/PDFを含むコールの場合、テキスト専用モデル（Gemma 等）はフォールバック先から除外
@@ -813,38 +815,63 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
       const isDailyQuota = !!r.isDailyQuota;     // 日次クォータ枯渇 → 翌日まで回復不可
       const isTpmQuota = !!r.isTpmQuota;          // TPM 超過 → 1分待てば回復
       const isRpmQuota = !!r.isRpmQuota;          // RPM 超過 → 1分待てば回復
-      const veryLongWait = r.retryAfterSec > 90;  // ★ サーバー指定 > 90s → さすがに別モデル推奨
+      const hasRealQuotaError = !!r.quotaId;     // ★ quotaId あり = Google のクォータシステムが反応 = 各リトライがクォータを消費
+      const veryLongWait = r.retryAfterSec > 90;  // サーバー指定 > 90s → 別モデル推奨
       const isLastModel = mIdx >= modelChain.length - 1;
-      const isUserSelected = mIdx === 0;          // ユーザーが選択したモデル（粘る価値あり）
+      const isUserSelected = mIdx === 0;          // ユーザーが選択したモデル
 
       if (r.kind === 'ratelimit') {
-        // ★ 日次クォータ枯渇のみ早期throw / フォールバック（短期は粘る）
+        // ★ 日次クォータ枯渇 → リトライ無意味、即フォールバック or throw
         if (isDailyQuota) {
+          failureLog.push({ model: tryModel, reason: `日次クォータ枯渇 (${r.quotaId || 'PerDay'})`, recoverable: 'tomorrow' });
           if (!isLastModel) {
-            notice(`⏳ ${tryModel} 日次クォータ枯渇 (${r.quotaId || 'PerDay'}) → 別モデルに切替`);
+            notice(`📅 ${tryModel} 日次クォータ枯渇 → 別モデルに切替`);
             break;
           } else {
-            throw new Error(`全モデル (${modelChain.join(' / ')}) の日次クォータ枯渇。\n翌日(UTC0時/日本朝9時)まで待機 or 別プロジェクトのキーを追加してください。\n[詳細: ${r.quotaId || r.message}]`);
+            // 全モデルの状況を踏まえて正確なメッセージを構築
+            const dailyExhausted = failureLog.filter(f => f.reason.includes('日次')).map(f => f.model);
+            const otherFailures = failureLog.filter(f => !f.reason.includes('日次'));
+            let errMsg = `❌ 抽出失敗\n\n`;
+            errMsg += `【日次枯渇 (翌日まで回復不可)】\n${dailyExhausted.map(m => `  ・${m}`).join('\n')}\n\n`;
+            if (otherFailures.length) {
+              errMsg += `【その他の失敗 (回復可能性あり)】\n${otherFailures.map(f => `  ・${f.model}: ${f.reason}`).join('\n')}\n\n`;
+            }
+            errMsg += `💡 対処:\n・翌日(UTC0時/日本朝9時)まで待機\n・別プロジェクトの API キーを追加して負荷分散\n・Google Cloud Billing 有効化で枠を大幅拡張`;
+            throw new Error(errMsg);
           }
         }
-        // 超長期待機指示 (>90s) のみフォールバック（30s〜90s は粘って待つ価値あり）
+
+        // ★ 本物のクォータエラー (quotaId あり) → 同モデルでのリトライは Google のクォータを消費するだけで無駄
+        // 即フォールバックして他モデルを試す
+        if (hasRealQuotaError && !isLastModel) {
+          failureLog.push({ model: tryModel, reason: `${isTpmQuota ? 'TPM' : isRpmQuota ? 'RPM' : '短期'} クォータ制限 (${r.quotaId})`, recoverable: 'wait' });
+          notice(`⏸ ${tryModel} ${isTpmQuota ? 'TPM' : isRpmQuota ? 'RPM' : '短期'}クォータ制限 → 別モデルに切替（同モデル再試行はクォータ無駄消費のため）`);
+          break;
+        }
+
+        // 超長期待機指示 (>90s) → フォールバック
         if (veryLongWait && !isLastModel) {
+          failureLog.push({ model: tryModel, reason: `超長期待機要 (${r.retryAfterSec}秒)`, recoverable: 'wait' });
           notice(`⏳ ${tryModel} 超長期待機要 (${r.retryAfterSec}秒) → 別モデルに切替`);
           break;
         }
-        // ★ ユーザー選択モデルは最低 attempt 0+1 の 2回試行を保証してから切替
-        // 即フォールバックを禁止することで、Google が retry-after=60s 程度を返してきても粘る
-        const giveUpAt = isUserSelected ? 3 : 2;
+
+        // 透過的 429 (quotaId なし、edge制限など) → 短期リトライで回復可能性あり
+        // ユーザー選択モデルは2回まで、フォールバック先は1回まで
+        const giveUpAt = isUserSelected ? 2 : 1;
         if (attempt >= giveUpAt && !isLastModel) {
-          notice(`⏳ ${tryModel} ${isTpmQuota ? 'TPM超過' : isRpmQuota ? 'RPM超過' : 'レート制限'} 継続 (${r.retryAfterSec}秒待機要) → 別モデルに切替`);
+          failureLog.push({ model: tryModel, reason: `透過的レート制限 (${attempt+1}回失敗)`, recoverable: 'wait' });
+          notice(`⏳ ${tryModel} レート制限継続 → 別モデルに切替`);
           break;
         }
-        // ★ 最終モデルでも、短期 429 (TPM等) なら 4回まで粘る (待機累計 ≈55秒)
-        // ダッシュボード上の RPM/RPD に余裕がある場合は短期バーストの可能性が高い
-        if (isLastModel && attempt >= 4) {
-          throw new Error(`選択モデル ${model}${modelChain.length > 1 ? ` (+ フォールバック ${modelChain.slice(1).join(', ')})` : ''} すべて連続的に短期レート制限。\n${
-            isTpmQuota ? '入力トークン量 (TPM) が一時的に上限超過の可能性' : 'API側の短期スロットリング'
-          }。\n💡 対処:\n・1〜2分待ってから再試行（TPM/RPMは1分で回復）\n・Google AI Studio ダッシュボードで RPD/TPM の使用率を確認\n・別プロジェクトのキーを追加して負荷分散\n・Critic監査(Stage4)を含む3パスで負荷が高い → 連投を避ける`);
+        // ★ 最終モデルでも、短期 429 (TPM等) なら 3回まで粘る (待機累計 ≈40秒)
+        // ※ quotaId があるエラーは上で既に throw 済みなので、ここに来るのは透過的 429 のみ
+        if (isLastModel && attempt >= 3) {
+          failureLog.push({ model: tryModel, reason: `${attempt+1}回連続短期レート制限`, recoverable: 'wait' });
+          let errMsg = `❌ 抽出失敗（全モデル試行済）\n\n【試行履歴】\n`;
+          errMsg += failureLog.map(f => `  ・${f.model}: ${f.reason}`).join('\n');
+          errMsg += `\n\n💡 対処:\n・1〜2分待ってから再試行（短期制限は1分で回復）\n・Google AI Studio ダッシュボードで RPD/TPM/RPM の使用率を確認\n・別プロジェクトのキーを追加して負荷分散\n・3パス精度パイプライン (核心+補完+Critic) は1論文=3コール → 5論文/日が上限`;
+          throw new Error(errMsg);
         }
       }
 
@@ -881,8 +908,12 @@ async function callGemini({ rotator, model, systemPrompt, userText, pdfBase64, i
     }
   }
 
-  // 全モデル試行後の失敗 → ヒント付きエラー
-  const hint = `\n\n💡 ヒント:\n・両モデル(Flash Lite/Flash)とも日次上限到達の可能性 → 翌日(UTC0時/日本朝9時)まで待機\n・別Googleプロジェクトで2個目のAPIキー作成 → 複数キー登録で枠が掛け算で拡張\n・どうしても急ぐなら Google Cloud Billing 有効化で Pay-as-you-go に切替（厳しい上限が大幅緩和）`;
+  // 全モデル試行後の失敗 → ヒント付きエラー（failureLog で各モデルの状況を明示）
+  let hint = '';
+  if (failureLog.length > 0) {
+    hint += `\n\n【各モデルの試行結果】\n` + failureLog.map(f => `  ・${f.model}: ${f.reason}`).join('\n');
+  }
+  hint += `\n\n💡 ヒント:\n・選択した複数モデルが全て失敗 → ダッシュボードで RPD/RPM/TPM を確認\n・別Googleプロジェクトで2個目のAPIキー作成 → 複数キー登録で枠が掛け算で拡張\n・Google Cloud Billing 有効化で Pay-as-you-go に切替（無料枠の厳しい上限が大幅緩和）`;
   throw (lastErr ? new Error(lastErr.message + hint) : new Error("Gemini呼び出しに失敗" + hint));
 }
 
