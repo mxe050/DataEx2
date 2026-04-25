@@ -2761,6 +2761,27 @@ JSON1個（配列でなく単一オブジェクト）だけを返答。マーク
 evidenceText には選択された原文（${type === 'image' ? '画像から読取り、' : ''}改変禁止、120文字以内に要約抜粋可）を、evidenceTextJa にその日本語訳を入れてください。
 数値（n, 平均, SD, 効果量, P値）は必ず構造化フィールドに入れてください。
 
+⚠⚠⚠ 最優先ルール: 選択範囲内に「2セットの (n, 数値)」があれば必ず2群として両方ペアリング ⚠⚠⚠
+
+選択テキスト/画像に「n=X ... n=Y ...」のように2セットの数値が併記されていれば、それは2つの群（介入群 vs 対照群）。
+ラベルが "Group A/B"・"Intervention/Control"・"Analyzed 6 years/Analyzed 5 years"・"PCR/SW"・"治療群/対照群" 等どんな表現でも、**併記された2セットの数値は2群として interventionGroup / comparisonGroup に必ず両方転記**する。片方のみは絶対にダメ。
+
+具体的な検出・転記例:
+[例A] "Analyzed 6 years (n=115) Cumulative successes (n=96) Cumulative failures (n=19) Analyzed 5 years (n=114) Cumulative successes (n=70) Cumulative failures (n=39)"
+  → interventionGroup={n_total:"115", events_or_mean:"96"}, comparisonGroup={n_total:"114", events_or_mean:"70"}
+  → effectEstimate に events と n から RR/OR を計算可能なら記入
+[例B] "Intervention (n=50): events 25 / Control (n=50): events 15"
+  → interventionGroup={n_total:"50", events_or_mean:"25"}, comparisonGroup={n_total:"50", events_or_mean:"15"}
+[例C] "Group A: 3.2 ± 1.1 (n=30) / Group B: 4.1 ± 1.3 (n=30)"
+  → interventionGroup={n_total:"30", events_or_mean:"3.2", sd_or_se:"1.1"}, comparisonGroup={n_total:"30", events_or_mean:"4.1", sd_or_se:"1.3"}
+[例D] 表で2列・図で2ボックス並列 → 両列・両ボックスを必ず抽出
+
+🛑 JSON 出力直前の自己チェック（必須・違反したら絶対ダメ）:
+□ 選択範囲に「n=X」と「n=Y」のように2セットの (n, 数値) が見えているか?
+□ 見えているなら comparisonGroup.n_total と comparisonGroup.events_or_mean が**両方とも埋まっている**か?
+□ 片方が "未抽出" / "不明" / 空のまま JSON を返すのは禁止
+□ 上記チェックを通過してから JSON を出力
+
 【🎯 2群比較RCT専用ルール（絶対遵守）】
 本アプリは2群比較RCT（介入群 vs 対照群）専用。3群以上は扱わない。
 - **イベント数 / 症例数(N) / 平均値 / SD は必ず介入群と対照群の両方を抽出**（片方のみは厳禁）
@@ -2791,12 +2812,18 @@ evidenceText には選択された原文（${type === 'image' ? '画像から読
 【鉄則】「どのアウトカム / どの時点 / どの解析集団（ITT/PP/safety等）/ どの分母 / どの統計量」を数字とセットで必ず記録。揃わない単独の数字は confidence="low" + notes に欠落項目を明記。`;
 
       const userPrompt = type === 'text'
-        ? `【論文の選択箇所（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】\n${text}\n\n上記から1個のアウトカム（actualOutcomeName, interventionGroup/comparisonGroup の数値, effectEstimate, evidenceText, evidenceTextJa, sourceLocation, pageNumber=${pageNum||0}, confidence）を抽出。`
+        ? `【論文の選択箇所（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】\n${text}\n\n上記から1個のアウトカム（actualOutcomeName, interventionGroup/comparisonGroup の数値, effectEstimate, evidenceText, evidenceTextJa, sourceLocation, pageNumber=${pageNum||0}, confidence）を抽出。
+
+⚠ 重要: 上記テキスト内に「n=X」と「n=Y」のように **2セットの (n, 数値) が併記**されていれば、それは介入群と対照群の両方。必ず両方を interventionGroup と comparisonGroup に転記してください。片方を "未抽出"/"不明"/空 のままにしないこと。
+出力前に自己チェック: comparisonGroup.n_total と comparisonGroup.events_or_mean が両方埋まっているか? 埋まっていないなら、テキストを再精読して2セット目の数値を抽出してから返答。`
         : `【論文画像（${pageNum ? `P.${pageNum}` : 'ページ不明'}）】の選択範囲から1個のアウトカムを抽出。
 画像内の数値・表のセル・グラフ軸目盛り・KMカーブの値などを丁寧に読取り、構造化フィールドに転記してください。
 sourceLocation には "Figure X" や "Table Y" のように出処、pageNumber=${pageNum||0}, confidence は medium または low（目視抽出のため）。
 evidenceText には画像内の文字・数値を文字起こし。evidenceTextJa はその日本語訳。
-figureType に種別（"Table"/"BarChart"/"LineChart"/"KaplanMeier"/"ForestPlot"/"Boxplot"）を記録。`;
+figureType に種別（"Table"/"BarChart"/"LineChart"/"KaplanMeier"/"ForestPlot"/"Boxplot"）を記録。
+
+⚠ 重要: 画像内に**2列の表 / 2つのボックス / 2本の棒グラフ / 2つの群ラベル**のように2群分の数値が併記されていれば、必ず両方を interventionGroup と comparisonGroup に転記。片方を "未抽出"/"不明"/空 のままにしないこと。
+出力前に自己チェック: comparisonGroup.n_total と comparisonGroup.events_or_mean が両方埋まっているか? 埋まっていないなら、画像を再精読して2群目の数値を抽出してから返答。`;
 
       let actualModelUsed = targetModel;
       const newOutcome = await callGemini({
