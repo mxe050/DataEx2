@@ -1978,7 +1978,7 @@ function UsageGuide() {
   );
 }
 
-function SetupPage({ onComplete, initialConfig }) {
+function SetupPage({ onComplete, initialConfig, onShowPhilosophy }) {
   // 旧バージョンの設定からの移行: providers.gemini.apiKey 単一 → apiKeys[] 配列
   const initialKeys = (() => {
     if (Array.isArray(initialConfig.apiKeys) && initialConfig.apiKeys.length) return initialConfig.apiKeys;
@@ -2033,10 +2033,16 @@ function SetupPage({ onComplete, initialConfig }) {
       <header className="bg-white/80 backdrop-blur-sm border-b border-slate-200/80 py-4 px-6 sticky top-0 z-10">
         <div className="max-w-4xl mx-auto flex items-center gap-3">
           <div className="bg-gradient-to-r from-blue-500 to-cyan-500 text-white p-2 rounded-lg"><Sparkles size={22}/></div>
-          <div>
+          <div className="flex-1">
             <h1 className="text-lg font-bold text-slate-800">Meta-Analysis Data Extractor <span className="text-xs gradient-text font-mono font-bold">v3 / Gemini Edition</span></h1>
             <p className="text-xs text-slate-500">Google AI Studio の無料APIキーで動く RCT データ抽出ツール</p>
           </div>
+          {onShowPhilosophy && (
+            <button onClick={onShowPhilosophy} title="本アプリの設計思想・抽出精度に関するエビデンスを表示"
+              className="text-[11px] bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 text-indigo-800 px-3 py-1.5 rounded font-bold flex items-center gap-1 whitespace-nowrap">
+              <BrainIcon size={13}/>📖 抽出の考え方
+            </button>
+          )}
         </div>
       </header>
       <main className="flex-1 max-w-4xl mx-auto w-full px-4 py-8">
@@ -2261,6 +2267,550 @@ function MetaPreviewModal({ preview, onClose, onCopy }) {
   );
 }
 
+/* ============================================================
+   AI抽出の基本的な考え方（解説ページ・全体仕様には影響しない独立コンテンツ）
+   ============================================================ */
+const PHILOSOPHY_MD = `# AIデータ抽出について(20260426)
+
+## 0. 背景と目的
+
+データ抽出は系統的レビューで最も誤りが多い工程で、誤り率は8-63% [13]。LLMによる自動抽出のaccuracyは中央値0.95だが範囲は0.36-1.00と極めて広く、研究間のばらつきが非常に大きい [2]。したがって本アプリは「完全自動化」ではなく「**AIで高速化しつつ、誤りを構造的に検出・修正させるワークフロー**」を提供する。
+
+---
+
+## 1. アーキテクチャ要件
+
+### 1-1. Dual-LLM並列実行を標準化
+
+異なる開発元の2モデル(例: GPT-5.2系 + Gemini 3 Pro系)を並列で同じPDFに対して実行し、結果を比較する。
+
+- 384フィールドのテストで両モデル一致正解82%、少なくとも片方が正解95.1% [1]
+- 抽出全体が30分・APIコスト合計$3.22 USDで完了 [1]
+- 単一モデル比較研究では性能差なし(Elicit vs ChatGPT)、相補的併用こそ効果がある [1がAndersen 2025を引用 = 文献15]
+- 不一致フィールドのみを人間レビューに回すことで負荷激減 [1]
+
+### 1-2. モデル世代を後世代に固定
+
+GPT-4以降相当のみを使用可能とし、それ未満は実装上ブロック。
+
+- T/A screening NPA: 早世代 0.58 → 後世代 0.91 [2]
+- Full-text screening NPA: 早世代 0.54 → 後世代 0.95 [2]
+- 早世代モデルは「関連なし論文」を多く拾い上げてしまう [2]
+
+### 1-3. APIフォールバック機構
+
+GPT・Gemini・Claudeのいずれかが障害時、ユーザーに選択肢を提示: ①片方のみで継続、②中断して再試行、③第三モデルへフォールバック。
+
+- 単一API依存はdual-LLMの論理的整合性を損なう [1]
+
+### 1-4. 決定論的設定をデフォルト
+
+- temperature = 0 固定 [1: KSA 70412でmodel temperature and randomness parameters were fixed to ensure reproducibility]
+- seed値固定(対応モデルのみ)
+- thinking mode = "high" を既定(GPT-5.2の場合)[1]
+
+根拠: LLMは非決定的、同じプロンプトでも結果が変わる [2]
+
+### 1-5. 内部「Web-UI相当の足場」を再構築
+
+APIで実装しつつも、Web-UIに組み込まれている事前最適化プロンプト・誘導ワークフロー・文脈構築を内部で再現。
+
+- T/A screening PPA: API 0.82 vs Web-UI 0.94 [2]
+- Full-text NPA: API 0.54 vs Web-UI 0.95 [2]
+- 原因はWeb-UIの暗黙最適化(preoptimized prompting, guided workflows, contextual memory)[2]
+
+具体策: systemプロンプトの自動構築、段階的ワークフロー強制、各ステップでコンテキスト蓄積。
+
+---
+
+## 2. プロンプト設計要件
+
+### 2-1. プロンプトをユーザーに直接書かせない
+
+ユーザーは「フィールド定義フォーム」に入力するだけで、内部で構造化プロンプトに自動展開する。
+
+- KSA 70412のプロンプト[1 Appendix Table A2]は1フィールドあたり10-20行の指示+例で構成され、素人がゼロから書くのは現実的でない
+- Nested Knowledge公式も「質問ベースのUIでも、内部はLLMプロンプトと同様に詳細指示を書け」と明記 [3]
+
+フォーム項目: フィールド名/データ型(連続/二値/カテゴリ/テキスト)/出力フォーマット例/除外条件/同義語/「not reported」時の扱い
+
+### 2-2. プロンプトのプリアンブル(全タスク共通固定文)
+
+[1 Appendix Table A2 General Rules] に基づき、全プロンプト先頭に以下を強制挿入:
+
+- \`Base extraction ONLY on the provided text chunk.\`
+- \`Do NOT guess or infer values. If not reported, write "not reported".\`
+- \`If values are reported only in tables or figures, you should still use them.\`
+- \`You MAY perform simple counting and arithmetic when directly based on explicit values (counting per-patient table entries, summing rows, computing n/total×100).\`
+- \`If an article gives multiple metrics for the same variable (e.g., both mean and median), you MUST report ALL reported values.\`
+
+### 2-3. 出力フォーマットの強制と例示
+
+[1 Appendix Table A2] の Examples 形式を継承し、許容形式を例で示す:
+
+- カウント+割合: \`n (%)\` 形式に統一(例: \`18/90 (20%)\` → \`18 (20%)\`、\`n=5 (10%)\` → \`5 (10%)\`、\`12 of 60 (20%)\` → \`12 (20%)\`)
+- 連続変数: \`mean (SD): X (Y) months\` / \`median (IQR): X (A-B) years\` / \`mean (SD)(range): X (Y) (min-max) months\`
+- 単位は常に明示
+- pre/post対比: \`Pre: <value (variance)> → Post: <value (variance)>, p = <p-value>\`
+
+### 2-4. コホート選択ロジックをプロンプト内に埋め込む
+
+抽出前のフィルタロジック自体をプロンプトに書き込む手法 [1 Appendix Table A2]:
+
+- 対象群の包含ルール(例: revision群のみ)
+- 除外群(例: primary-only対照、no-revision群)
+- 複数サブグループがある場合の優先順位(overall summaryがあれば優先、なければサブグループ別に)
+- 不明確な場合は \`not reported\` で返す
+
+### 2-5. プロンプトはイテレーティブに開発させる
+
+UIに「Draft → Test → Revise → Run」のステップを明示し、本実行前に必ずテストランを通させる [3]。
+
+---
+
+## 3. データモデル要件
+
+### 3-1. 連続/二値/カテゴリの3型を厳密に区別
+
+データ要素ごとに型を定義 [4]:
+
+- **連続変数**(年齢、フォローアップ期間など): 中心値(mean/median)+ 分散値(SD/IQR/range)+ 単位 のセットで保持
+- **二値変数**(性別、合併症の有無): カウント + 割合
+- **カテゴリ変数**(治療群、グラフトタイプ): 各カテゴリのカウント + 割合
+
+### 3-2. アーム × 時点 × アウトカムの構造を持つ
+
+タグの階層構造でデータを表現し、平面スプレッドシートに押し込まない [3][5]。
+
+- アーム階層: \`Arm: Drug A\` / \`Arm: Drug B\` のように命名規約で arm-level を明示 [5]
+- 時点: Baseline / Outcome / Other に分類 [4]
+- ネストは浅く・一貫して [5]
+
+### 3-3. Tag Tableモード(構造化抽出用)
+
+連続/二値/カテゴリの3型に収まらない arm × outcome × timepoint の表形式データ用に、別UIを用意 [5]。
+
+- 例: 「Treatment Arm × Number of Patients × Timepoint × ORR(n,%) × CR(n,%) × PR(n,%) × SD(n,%)」のような表
+
+### 3-4. SE/SDの混同を自動検出
+
+連続変数で「Standard Error が報告されている可能性」を検知し、ユーザーに警告 [4]。SDはSE × √n で変換可能。
+
+---
+
+## 4. 検証・トレーサビリティ要件
+
+### 4-1. 全フィールドにPDF原文quoteを必須
+
+LLMの出力には必ず根拠となるPDF抜粋を付随させる。[2]がハルシネーション対策としてsource-grounded promptingを推奨 [20]。
+
+### 4-2. PDF原文への直接ジャンプ
+
+抽出値をクリックするとPDF該当ページの該当箇所がハイライトされる仕組み。[7][9][10]の共通機能。
+
+- Laser AI: モデル提案値がPDFソースに直接リンク、accept/edit/reject可能 [7]
+- Elicit: セルクリックで supporting quote 表示、sentence-level citation [9][10]
+
+### 4-3. ユーザーによる手動範囲再登録
+
+LLMが拾わなかった箇所をユーザーがドラッグ選択し、「+」ボタンで根拠箇所として登録できる(Laser AI方式)[7]。
+
+- 再現性確保: 後で見直すときに「ここを根拠とした」が記録されている
+
+### 4-4. quote実在の自動検証(ハルシネーション検出)
+
+LLMが返したquoteが実際にPDF内に存在するかをfuzzy matchで検証し、不一致なら赤フラグ表示。
+
+- 含まれた研究のうち、ハルシネーション対策(RAG, source-grounded)を報告したものはほぼなかった [2 Discussion]
+
+### 4-5. 完全な操作ログ(audit trail)
+
+全操作・モデル名・モデルバージョン・プロンプト・温度設定・seed・実行日時・トークン数・コストを記録 [7]。
+
+- Laser AI: 「すべての決定・変更・操作を記録、組織に完全な可視性と説明責任を提供」 [7]
+- 文献[2]も「model versions and prompt details were scarcely reported」を再現性問題として批判
+
+---
+
+## 5. 再現性・品質保証要件
+
+### 5-1. 同一スタディ×複数回実行による一致率表示
+
+同じPDFに同じプロンプトで3回実行し、結果の安定性をユーザーに見せる。
+
+- LLMは決定的でない、温度0でも完全には一致しない可能性がある [2]
+
+### 5-2. Pilot mode(本実行前のテスト)
+
+2-3論文で抽出ルールを試し、ユーザーが調整してから本実行に進ませる [9]。
+
+- Elicitが「ランダムpilot setで先にテスト」を実装済み [9]
+- Nested Knowledgeも「Sanity-check a few studies first」を必須tipsに挙げている [3]
+
+### 5-3. ユーザーゴールドスタンダードによる自己検証
+
+ユーザーが過去に手作業で抽出済みのレビューをアップロードし、自分の研究領域でのアプリ精度を即時計算・表示。
+
+- 公開ベンチマークデータセットが存在しない [2 Discussion 2nd point]
+- KSA 70412も自前で gold-standard を構築する手順を採用 [1: 医学生2名独立抽出 → 競合解決 → 整形外科レジデント検証]
+
+### 5-4. モデル更新時のre-validation通知
+
+LLMバージョンが更新された場合、過去の抽出結果について再検証するかをユーザーに促す。
+
+- 「LLMs are constantly evolving, periodic re-validation is important」 [1 Discussion limitations]
+
+### 5-5. PRISMA-AI / CONSORT-AI / STARD-AI準拠Methodsテキスト自動生成
+
+論文Methods欄にそのまま貼れる形で、使用モデル・バージョン・プロンプト全文・温度・seed・実行日時・抽出件数・トークン数・コスト・人間検証フローを出力。
+
+- CONSORT-AI [18]
+- STARD-AI [19]
+- 報告標準化が再現性の鍵 [2 Discussion 1st point]
+
+---
+
+## 6. 誤り検出ルール(KSA 70412エラーパターンに基づく後処理)
+
+KSA 70412で実際に観察された主要エラー型を、ルールベースで自動検出する [1]:
+
+### 6-1. 分散値欠落の検出
+
+中心値(mean/median)はあるが分散指標(SD/IQR/range)が欠落しているフィールドを「partial」フラグで表示。
+
+- KSA 70412で最頻のpartial原因 [1]
+- メタ解析pooling に必須なので欠落は致命的 [1 Discussion]
+
+### 6-2. Primary/Revisionスワップ検出
+
+primary surgery と revision surgery のフィールド間で内容が類似しすぎている場合、スワップの可能性を警告。
+
+- KSA 70412のSecondary surgery details で 68.8% と相対的に低いaccuracyの主因 [1]
+
+### 6-3. 単位欠落の検出
+
+連続変数で単位(months/years/mm/g等)が欠落していたら警告。
+
+- プロンプトで \`ALWAYS provide units\` と強制 [1 Appendix Table A2]
+
+### 6-4. 「partial」と「complete failure」の区別表示
+
+LLM出力を correct / partially correct / incorrect の3段階で表示し、「completely failure」と「minor omission」を視覚的に区別する。
+
+- KSA 70412は3段階分類を採用、partialが大半でhallucinationは稀 [1]
+
+---
+
+## 7. UX設計要件(Automation Bias対策)
+
+### 7-1. 根拠quoteを必ず開かせるステップ
+
+Acceptボタンを押す前に、必ず根拠quoteを展開・確認させるUI(クリック回数で強制)。
+
+- 「caution by human verifiers must be taken to minimise automation bias」 [1 Discussion]
+- 文献[16] Kücking 2024: AI意思決定支援におけるautomation biasを実証
+
+### 7-2. 全フィールド一括Acceptを禁止
+
+ユーザーが全件まとめて承認することを許さず、最低限フィールドごとに目を通させる。
+
+### 7-3. 「partial」状態の明示UI
+
+KSA 70412の3段階分類をUIに反映 [1]。
+
+### 7-4. 検証ステップの省略不可
+
+データ抽出はaccuracy 0.36-1.00と幅広いため [2]、人間検証ステップは飛ばせない設計とする。
+
+---
+
+## 8. タスクごとの自動化レベル
+
+エビデンスに基づき、タスク別に自動化レベルを変える [2]:
+
+| タスク | 性能 | 自動化レベル |
+|---|---|---|
+| Title/Abstract screening | PPA 0.92 / NPA 0.89 [2] | AI=レビュアー1名相当として運用可。ヒト1名確認で完結 |
+| Full-text screening | PPA 0.93 / NPA 0.92 [2] | 同上 |
+| **Data extraction** | accuracy 0.36-1.00、中央値0.95 [2] | dual-LLM初稿 → ヒト全件検証(必須) [1][2] |
+| Risk of bias assessment | accuracy 0.44-0.90、中央値0.62 [2] | AIはドラフト提案のみ、ヒトが必ず確定 [2] |
+| 検索式作成 | accuracy 0.78-0.89(n=2)[2] | AIは候補生成のみ、ヒトが選定 |
+| 研究課題同定 | accuracy 0.68-0.83、中央値0.74 [2] | 候補生成のみ |
+
+---
+
+## 9. 出力・エクスポート要件
+
+### 9-1. メタ解析直結のexport形式
+
+- R用CSV(\`meta\`/\`metafor\`パッケージ対応)
+- RevMan形式
+- 効果量自動計算オプション(odds ratio、risk ratio、SMD等)
+
+根拠: Paperguideが「効果サイズ・信頼区間・統計データ用の標準化extraction tableを構築」を実装済み [11]
+
+### 9-2. PRISMA-AI準拠Methods欄テキスト
+
+§5-5記載の通り。
+
+### 9-3. Audit log一括export
+
+§4-5記載のログをCSV/JSONで出力可能に。
+
+---
+
+## 10. セキュリティ・コンプライアンス要件
+
+- ISO 27001、SOC 2、FedRAMP相当のセキュリティ要件を念頭に置く(将来の組織展開で必要)[7]
+- ユーザーアップロードPDFの取り扱いポリシーを明示
+- LLM API側へのデータ送信について、各APIプロバイダのデータ保持ポリシーをユーザーに通知
+
+---
+
+## 11. 段階的実装ロードマップ(MVP→拡張)
+
+エビデンスに基づき、最小実装から段階的に拡張する。
+
+### Phase 1: MVP(最小実装)
+
+- 1論文PDF入力
+- フィールド定義フォーム → 構造化プロンプト自動生成
+- GPT後世代1モデルで抽出 [2]
+- PDF原文quote必須出力 [20]
+- 人間検証UI(accept/edit/reject)[7]
+- temperature=0固定 [1]
+
+### Phase 2: コア機能
+
+- Dual-LLM並列実行 [1]
+- 不一致フィールドフラグ表示 [1]
+- §6の誤り検出ルール後処理 [1]
+- audit log [7]
+- §9-2 のPRISMA-AI Methods自動生成 [18][19]
+
+### Phase 3: 拡張
+
+- Pilot mode [9]
+- 同一スタディ×3回一致率表示 [2]
+- ユーザーゴールドスタンダード自己検証
+- Tag Tableモード [5]
+- メタ解析直結export [11]
+
+### Phase 4: 高度機能
+
+- グラフ/Figure からの数値抽出
+- Living review対応(新規論文追加で再実行)[10]
+- 組織テンプレート共有 [7]
+
+---
+
+## 12. 検証方法
+
+開発完了後、以下で性能を検証する:
+
+- 既存の手作業抽出済みSR(KSA 70412のような既知のgold-standardあり研究)を入力し、accuracy/agreement を測定
+- 文献[1]の48フィールド × 8研究 = 384データ点ベンチマークと比較
+- 結果を CONSORT-AI [18]・STARD-AI [19]に準拠して報告
+
+---
+
+## 開発依頼時の留意
+
+この仕様書をバイブコーディングAIに渡す場合、以下を伝えると齟齬が減ります:
+
+- 「§1-2のモデル世代固定」は**ハードコーディング**で実装してほしい(ユーザー設定で回避できないように)
+- 「§7-1〜7-4のautomation bias対策」は**省略しないでほしい**(性能向上の見栄えと引き換えに削られがち)
+- 「§4-1〜4-5のtraceability」は **後付けが極めて困難**なので**Phase 1から組み込む**
+
+各要件の根拠論文・公式ドキュメントは冒頭の参考文献リストにすべて記載してあります。
+
+## 参考文献一覧
+
+本要件書は以下の一次資料に基づく。各要件には末尾に [文献番号] で出典を明示する。
+
+**[1]** Vivekanantha P, Kahlon H, Balogun OT, Bouchard MD, de Sa D, Ayeni OR, Kay J. Automated data extraction for systematic reviews using GPT-5.2 and Google Gemini Pro 3: A dual-large language model approach in orthopaedic research. Knee Surg Sports Traumatol Arthrosc. 2026;1-19. DOI: 10.1002/ksa.70412
+※ ユーザー提供PDFを精読。Appendix Table A1(48フィールド抽出スキーマ)・Table A2(完全プロンプト本文)を含む
+
+**[2]** Laignelot F, Martin GL, Ossman M, Pingeon O, Boubaker A, Picovschi E, Kim J, Tannier X, Cohen JF, Dechartres A. Large language models show promising performance for some systematic review tasks but call for cautious implementation: a systematic review. Journal of Clinical Epidemiology. 2026;194:112221. DOI: 10.1016/j.jclinepi.2026.112221
+※ ユーザー提供PDFを精読。63研究・148評価のシステマティックレビュー
+
+**[3]** Nested Knowledge公式ドキュメント: Crafting the Perfect Prompts for Nested Knowledge's AI Tools. https://about.nested-knowledge.com/docs/crafting-the-perfect-prompts-for-nested-knowledges-ai-tools/ (2025年11月更新)
+
+**[4]** Nested Knowledge公式ドキュメント: Best Practices for Meta-Analytical Extraction. https://about.nested-knowledge.com/docs/best-practices-for-ma-extraction/ — Mathes T, Klaßen P, Pieper D (2017) BMC Med Res Methodol 17:152 を引用
+
+**[5]** Nested Knowledge公式ドキュメント: Tag Tables, Explained. https://about.nested-knowledge.com/2023/07/10/tag-tables-explained/
+
+**[6]** Nested Knowledge公式ドキュメント: Smart MA Extraction. https://about.nested-knowledge.com/docs/smart-ma-extraction/
+
+**[7]** Laser AI公式: Product features. https://www.laser.ai/product
+
+**[8]** Laser AI公式: Solutions — NIEHSによる独立評価で抽出時間53%削減を実証。https://www.laser.ai/solutions
+
+**[9]** Elicit公式サポート: Systematic Reviews in Elicit. https://support.elicit.com/en/articles/7927169
+
+**[10]** Elicit公式: Systematic Literature Reviews — VDI/VDEドイツ教育政策SRで1,511データポイント中1,502正解(99.4%)を実証。https://elicit.com/solutions/literature-review
+
+**[11]** Paperguide公式: Meta-Analyses & Systematic Reviews. https://paperguide.ai/solutions/systematic-reviews/
+
+**[12]** Gartlehner G, Kugley S, Crotty K, Viswanathan M, Dobrescu A, Nussbaumer-Streit B, et al. Artificial intelligence-assisted data extraction with a large language model: a study within reviews. Ann Intern Med. 2025;178(12):1763-71. — KSA 70412 ref [8]
+
+**[13]** Mathes T, Klaßen P, Pieper D. Frequency of data extraction errors and methods to increase data extraction quality: a methodological review. BMC Med Res Methodol. 2017;17:152. — 文献[1][4]で引用
+
+**[14]** Murton M, Boulton E, Cross S, Khan A, Kumar S, Magri G, et al. Harnessing large-language models for efficient data extraction in systematic reviews: the role of prompt engineering. Cochrane Evid Synth Methods. 2025;3(6):e70058. — 文献[1] ref [17]
+
+**[15]** Andersen TH, Marcussen TM, Termannsen AD, Lawaetz TWH, Nørgaard O. Using artificial intelligence tools as second reviewers for data extraction in systematic reviews. Cochrane Evid Synth Methods. 2025;3(4):e70036. — 文献[1] ref [12]
+
+**[16]** Kücking F, Hübner U, Przysucha M, et al. Automation bias in AI-decision support: results from an empirical study. Stud Health Technol Inform. 2024;317:298-304. — 文献[1] ref [15]
+
+**[17]** Sounderajah V, Ashrafian H, Rose S, et al. A quality assessment tool for AI-centered diagnostic test accuracy studies: QUADAS-AI. Nat Med. 2021;27:1663-5. — 文献[2] ref [13]
+
+**[18]** Liu X, Cruz Rivera S, Moher D, Calvert MJ, Denniston AK. Reporting guidelines for clinical trial reports for interventions involving artificial intelligence: the CONSORT-AI extension. Nat Med. 2020;26:1364-74. — 文献[2] ref [32]
+
+**[19]** Sounderajah V, Guni A, Liu X, et al. The STARD-AI reporting guideline for diagnostic accuracy studies using artificial intelligence. Nat Med. 2025;31:3283-9. — 文献[2] ref [33]
+
+**[20]** Gao Y, Xiong Y, Gao X, et al. Retrieval-augmented generation for large language models: a survey. arXiv. 2024. — 文献[2] ref [34]
+`;
+
+// 最小限のMarkdown→JSXレンダラ。見出し / 段落 / 箇条書き / 番号付き / 表 / 区切り線 / 太字 / 斜体 / インラインコード / リンクに対応
+function renderMarkdown(md) {
+  const lines = md.split('\n');
+  const blocks = [];
+  let i = 0;
+
+  const renderInline = (text) => {
+    const nodes = [];
+    let cursor = 0;
+    const re = /(\*\*[^*\n]+\*\*|`[^`\n]+`|\[[^\]\n]+\]\([^)\n]+\))/g;
+    let m;
+    while ((m = re.exec(text)) !== null) {
+      if (m.index > cursor) nodes.push(text.substring(cursor, m.index));
+      const tok = m[0];
+      const k = `${cursor}-${nodes.length}`;
+      if (tok.startsWith('**')) nodes.push(<strong key={k} className="font-bold text-slate-900">{tok.slice(2, -2)}</strong>);
+      else if (tok.startsWith('`')) nodes.push(<code key={k} className="bg-slate-100 text-rose-700 px-1.5 py-0.5 rounded text-[90%] font-mono">{tok.slice(1, -1)}</code>);
+      else {
+        const linkM = tok.match(/\[([^\]]+)\]\(([^)]+)\)/);
+        if (linkM) nodes.push(<a key={k} href={linkM[2]} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:text-blue-800 underline break-all">{linkM[1]}</a>);
+      }
+      cursor = m.index + tok.length;
+    }
+    if (cursor < text.length) nodes.push(text.substring(cursor));
+    return nodes;
+  };
+
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { i++; continue; }
+
+    if (line.startsWith('### ')) {
+      blocks.push(<h3 key={i} className="text-[14px] font-bold text-slate-800 mt-5 mb-2">{renderInline(line.substring(4))}</h3>);
+      i++; continue;
+    }
+    if (line.startsWith('## ')) {
+      blocks.push(<h2 key={i} className="text-[16px] font-bold text-purple-700 mt-6 mb-2 border-b border-purple-200 pb-1">{renderInline(line.substring(3))}</h2>);
+      i++; continue;
+    }
+    if (line.startsWith('# ')) {
+      blocks.push(<h1 key={i} className="text-[18px] font-extrabold text-purple-900 mt-3 mb-3 pb-2 border-b-2 border-purple-300">{renderInline(line.substring(2))}</h1>);
+      i++; continue;
+    }
+
+    if (/^---+\s*$/.test(line.trim())) {
+      blocks.push(<hr key={i} className="my-4 border-slate-300"/>);
+      i++; continue;
+    }
+
+    // 表の検出: 1行目 = ヘッダー、2行目 = "| --- | --- |" のような区切り、3行目以降 = データ
+    if (line.startsWith('|') && lines[i+1] && /^\s*\|[\s\|:\-]+\|\s*$/.test(lines[i+1])) {
+      const headerCells = line.split('|').slice(1, -1).map(c => c.trim());
+      i += 2;
+      const rows = [];
+      while (i < lines.length && lines[i].startsWith('|')) {
+        rows.push(lines[i].split('|').slice(1, -1).map(c => c.trim()));
+        i++;
+      }
+      blocks.push(
+        <div key={`tbl-${i}`} className="my-3 overflow-x-auto">
+          <table className="border-collapse text-[11px] min-w-full">
+            <thead className="bg-purple-100">
+              <tr>{headerCells.map((c, j) => <th key={j} className="border border-purple-200 px-2 py-1 text-left font-bold text-purple-900">{renderInline(c)}</th>)}</tr>
+            </thead>
+            <tbody>
+              {rows.map((r, k) => (
+                <tr key={k} className={k % 2 ? 'bg-slate-50' : 'bg-white'}>
+                  {r.map((c, j) => <td key={j} className="border border-slate-200 px-2 py-1 text-slate-700 align-top">{renderInline(c)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      );
+      continue;
+    }
+
+    // 箇条書き (- ...)
+    if (/^\s*-\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*-\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*-\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ul key={`ul-${i}`} className="my-2 ml-5 list-disc space-y-1 text-[12px] text-slate-700">
+          {items.map((t, j) => <li key={j} className="leading-relaxed">{renderInline(t)}</li>)}
+        </ul>
+      );
+      continue;
+    }
+
+    // 番号付きリスト (1. 2. ...)
+    if (/^\s*\d+\.\s/.test(line)) {
+      const items = [];
+      while (i < lines.length && /^\s*\d+\.\s/.test(lines[i])) {
+        items.push(lines[i].replace(/^\s*\d+\.\s+/, ''));
+        i++;
+      }
+      blocks.push(
+        <ol key={`ol-${i}`} className="my-2 ml-5 list-decimal space-y-1 text-[12px] text-slate-700">
+          {items.map((t, j) => <li key={j} className="leading-relaxed">{renderInline(t)}</li>)}
+        </ol>
+      );
+      continue;
+    }
+
+    // 段落
+    blocks.push(<p key={i} className="my-2 text-[12px] text-slate-700 leading-relaxed">{renderInline(line)}</p>);
+    i++;
+  }
+
+  return blocks;
+}
+
+// 解説モーダル: アプリの設計思想・エビデンスを表示する独立ページ。
+// 全体仕様には影響しない（純粋な情報表示・read-only / state変更なし）。
+function PhilosophyPanel({ onClose }) {
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-2xl w-full max-w-4xl max-h-[92vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        <div className="flex items-center justify-between px-5 py-3 border-b border-slate-200 bg-gradient-to-r from-indigo-50 to-purple-50 flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <BrainIcon size={18} className="text-purple-700"/>
+            <span className="font-bold text-sm text-purple-900">📖 AIによるデータ抽出の基本的な考え方</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-red-600 text-xl font-bold leading-none px-2" title="閉じる">×</button>
+        </div>
+        <div className="flex-1 overflow-y-auto px-6 py-4 bg-white">
+          {renderMarkdown(PHILOSOPHY_MD)}
+        </div>
+        <div className="flex items-center justify-between px-5 py-2 border-t border-slate-200 bg-slate-50 flex-shrink-0">
+          <span className="text-[10px] text-slate-500">本ページは設計思想の解説であり、抽出機能とは独立した情報ページです</span>
+          <button onClick={onClose} className="text-[11px] bg-slate-700 hover:bg-slate-800 text-white px-3 py-1 rounded font-bold">閉じる</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StageIndicator({ currentStage, progress, message }) {
   const stages = [
     { id: 'stage1', label: 'PDF準備', icon: FileText },
@@ -2299,7 +2849,7 @@ function StageIndicator({ currentStage, progress, message }) {
   );
 }
 
-function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
+function ExtractorPage({ apiKeys, model: initialModel, onBack, onShowPhilosophy }) {
   // ローカルでモデル状態を持つ → 結果画面からでも変更可能
   const [model, setModel] = useState(initialModel);
   // 抽出中のモデル変更を次のステージから即反映するためのref
@@ -2671,6 +3221,13 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
                 <span className="text-blue-700 text-[10px] font-mono bg-blue-100 px-1 rounded flex-shrink-0">×{apiKeys.length}キー</span>
               )}
             </div>
+            {/* AI抽出の考え方ページ: 設計思想・エビデンス */}
+            {onShowPhilosophy && (
+              <button onClick={onShowPhilosophy} title="本アプリの設計思想・抽出精度に関するエビデンス"
+                className="text-[10px] bg-indigo-50 hover:bg-indigo-100 border border-indigo-300 text-indigo-800 px-2 py-1 rounded flex items-center gap-1 font-bold transition-colors">
+                <BrainIcon size={12}/>📖 考え方
+              </button>
+            )}
             {/* API診断ボタン: DevTools 不要で全API通信を確認 */}
             <button onClick={() => setShowDiag(true)} title="全API通信ログを表示（DevTools不要）"
               className="text-[10px] bg-slate-800 hover:bg-slate-900 text-white px-2 py-1 rounded flex items-center gap-1 font-bold transition-colors">
@@ -3079,6 +3636,7 @@ function App() {
   const [apiKeys, setApiKeys] = useState([]);
   const [model, setModel] = useState(GEMINI.defaultModel);
   const [initialConfig] = useState(() => loadConfig());
+  const [showPhilosophy, setShowPhilosophy] = useState(false);
 
   const handleSetupComplete = ({ apiKeys, model }) => {
     // 二重防御: 無効モデルIDが渡された場合はデフォルトに戻す
@@ -3088,8 +3646,17 @@ function App() {
     setPage("main");
   };
 
-  if (page === "setup") return <SetupPage onComplete={handleSetupComplete} initialConfig={initialConfig}/>;
-  return <ExtractorPage apiKeys={apiKeys} model={model} onBack={() => setPage("setup")}/>;
+  const onShowPhilosophy = () => setShowPhilosophy(true);
+
+  return (
+    <>
+      {page === "setup"
+        ? <SetupPage onComplete={handleSetupComplete} initialConfig={initialConfig} onShowPhilosophy={onShowPhilosophy}/>
+        : <ExtractorPage apiKeys={apiKeys} model={model} onBack={() => setPage("setup")} onShowPhilosophy={onShowPhilosophy}/>
+      }
+      {showPhilosophy && <PhilosophyPanel onClose={() => setShowPhilosophy(false)}/>}
+    </>
+  );
 }
 
 ReactDOM.createRoot(document.getElementById('root')).render(<App/>);
