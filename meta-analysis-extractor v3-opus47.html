@@ -985,6 +985,293 @@ function baselineRow(b) {
     b.pValue||"-", b.sourceLocation||"-", b.pageNumber||"-"];
 }
 
+/* ------------------------------------------------------------
+   メタ分析ソフト連携用エクスポート（純粋関数 — read-only / 副作用なし）
+   - RevMan Web 用 TSV（二値 / 連続）
+   - R metafor 用スクリプト（二値 / 連続）
+   抽出失敗箇所は必ず空白。推測値・代用値は入れない。
+   ------------------------------------------------------------ */
+
+// 文字列から先頭の数値だけを抽出。失敗 / "不明" / "-" / "未抽出" / 空 → 空文字
+function extractNumber(s) {
+  if (s === null || s === undefined) return '';
+  const t = String(s).trim();
+  if (t === '' || t === '-' || t === '不明' || t === '未抽出' || t === 'NA' || t === 'N/A') return '';
+  const m = t.match(/^-?\d+(?:\.\d+)?/);
+  return m ? m[0] : '';
+}
+
+// 95%CI 文字列をパース。"0.23-0.63" / "0.23 to 0.63" / "(0.23, 0.63)" / "0.23–0.63" / "-1.0 to -0.6" 等に対応
+// 負の値の先頭マイナスを誤って区切りにしないよう、ハイフンは「直前が数字」の場合のみ区切りとして扱う
+function parseCI(ci95) {
+  if (!ci95) return { lower: '', upper: '' };
+  const t = String(ci95).replace(/[()\[\]]/g, '').trim();
+  // 区切り: "to" / カンマ / en/em-dash 類 / 数字直後のハイフン
+  const parts = t.split(/\s*(?:to|,|–|—|‐|−)\s*|(?<=\d)\s*-\s*/i).map(s => s.trim()).filter(Boolean);
+  if (parts.length < 2) return { lower: '', upper: '' };
+  const lo = extractNumber(parts[0]);
+  const hi = extractNumber(parts[1]);
+  return { lower: lo, upper: hi };
+}
+
+// 連続量の metric を actualOutcomeName / notes / calculationMethod から推定
+function inferMetric(o) {
+  const text = [(o.actualOutcomeName||''), (o.notes||''), (o.calculationMethod||'')].join(' ').toLowerCase();
+  if (/ancova|adjusted|ls\s*mean|調整|adjusted\s*md/i.test(text)) return 'adjusted-difference';
+  if (/変化量|change[\s-]*from[\s-]*baseline|change[\s-]*score|post[\s-]*pre|pre[\s-]*post|δ|delta|\bchange\b/i.test(text)) return 'change-from-baseline';
+  if (/術前|baseline|pre[\s-]*op|preoperative|pre[\s-]*treatment|pre[\s-]*intervention/i.test(text)) return 'baseline-value';
+  return 'post-value';
+}
+
+// PDFファイル名から study ID を生成（拡張子と特殊文字を除去、空白→アンダースコア）
+function deriveStudyId(filename) {
+  if (!filename) return 'Study_1';
+  return String(filename)
+    .replace(/\.[^.]+$/, '')
+    .replace(/[^A-Za-z0-9_\-぀-ヿ一-鿿]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .substring(0, 60) || 'Study_1';
+}
+
+// CSV/TSV セルのエスケープ（区切り・改行・クォート対応）
+function csvEscape(v, delimiter) {
+  if (v === null || v === undefined) return '';
+  const s = String(v);
+  if (s === '') return '';
+  if (s.includes(delimiter) || s.includes('"') || s.includes('\n') || s.includes('\r')) {
+    return '"' + s.replace(/"/g, '""') + '"';
+  }
+  return s;
+}
+
+function buildDelimitedTable(headers, rows, delimiter) {
+  const lines = [headers.map(h => csvEscape(h, delimiter)).join(delimiter)];
+  rows.forEach(r => lines.push(r.map(c => csvEscape(c, delimiter)).join(delimiter)));
+  return lines.join('\n');
+}
+
+// reported_RR / reported_OR / reported_HR / reported_RD のうち measureType に対応する列にのみ値を入れる
+function buildBinaryEffectColumns(eff) {
+  const out = { reported_RR: '', reported_OR: '', reported_HR: '', reported_RD: '' };
+  if (!eff) return out;
+  const mt = String(eff.measureType||'').toUpperCase();
+  const v = extractNumber(eff.value);
+  if (!v) return out;
+  if (mt === 'RR') out.reported_RR = v;
+  else if (mt === 'OR') out.reported_OR = v;
+  else if (mt === 'HR') out.reported_HR = v;
+  else if (mt === 'RD' || mt === 'ARR' || mt === 'NNT') out.reported_RD = v;
+  return out;
+}
+
+// log(HR) と SE_log_HR を計算（HRが取れる時のみ）
+function computeLogHR(eff) {
+  const out = { log_HR: '', SE_log_HR: '' };
+  if (!eff) return out;
+  const mt = String(eff.measureType||'').toUpperCase();
+  if (mt !== 'HR') return out;
+  const hr = parseFloat(extractNumber(eff.value));
+  if (!isFinite(hr) || hr <= 0) return out;
+  const { lower, upper } = parseCI(eff.ci95);
+  const lo = parseFloat(lower), up = parseFloat(upper);
+  out.log_HR = Math.log(hr).toFixed(4);
+  if (isFinite(lo) && isFinite(up) && lo > 0 && up > 0 && up > lo) {
+    out.SE_log_HR = ((Math.log(up) - Math.log(lo)) / 3.92).toFixed(4);
+  }
+  return out;
+}
+
+// 連続量で reported_MD / reported_SMD / reported_AdjMD のうち対応列にのみ値を入れる
+function buildContinuousEffectColumns(eff, metric) {
+  const out = { reported_MD: '', reported_SMD: '', reported_AdjMD: '' };
+  if (!eff) return out;
+  const mt = String(eff.measureType||'').toUpperCase();
+  const v = extractNumber(eff.value);
+  if (!v) return out;
+  if (metric === 'adjusted-difference') out.reported_AdjMD = v;
+  else if (mt === 'SMD') out.reported_SMD = v;
+  else if (mt === 'MD' || mt === '') out.reported_MD = v;
+  return out;
+}
+
+// 95%CIから SE を計算: (upper - lower) / 3.92
+function computeSEFromCI(eff) {
+  if (!eff) return '';
+  const { lower, upper } = parseCI(eff.ci95);
+  const lo = parseFloat(lower), up = parseFloat(upper);
+  if (!isFinite(lo) || !isFinite(up) || up <= lo) return '';
+  return ((up - lo) / 3.92).toFixed(4);
+}
+
+// SD/SE 判定: sdOrSe フィールドが "SE" 系なら値は SE 列に入れて SD は空白、それ以外は SD 列に入れる
+function splitSdOrSe(group, sdOrSeLabel) {
+  const raw = extractNumber(group?.sd_or_se);
+  const isSE = /SE|SEM|standard\s*error/i.test(String(sdOrSeLabel||'')) || /SE|SEM/i.test(String(group?.sd_or_se||''));
+  if (!raw) return { sd: '', se: '' };
+  return isSE ? { sd: '', se: raw } : { sd: raw, se: '' };
+}
+
+// アウトカムタイプの判定（variableType 優先、不明時は effectEstimate.measureType でフォールバック）
+function isBinaryOutcome(o) {
+  const vt = String(o.variableType||'').toLowerCase();
+  if (vt.includes('binary') || vt.includes('time')) return true; // TimeToEvent も二値テーブルに含める（HR共通のため）
+  if (vt.includes('continuous')) return false;
+  // フォールバック: measureType
+  const mt = String(o.effectEstimate?.measureType||'').toUpperCase();
+  if (['RR','OR','HR','RD','ARR','NNT'].includes(mt)) return true;
+  if (['MD','SMD'].includes(mt)) return false;
+  // 最終フォールバック: events/mean に "/" や "%" があれば二値
+  const ev = String(o.interventionGroup?.events_or_mean||'') + ' ' + String(o.comparisonGroup?.events_or_mean||'');
+  if (/\/|%/.test(ev)) return true;
+  return false;
+}
+
+// === RevMan用 二値アウトカム TSV ===
+const REVMAN_BINARY_HDRS = [
+  'outcome', 'study', 'timepoint', 'population',
+  'events_intervention', 'total_intervention', 'events_control', 'total_control',
+  'reported_RR', 'reported_OR', 'reported_HR', 'reported_RD',
+  'ci95_lower', 'ci95_upper', 'log_HR', 'SE_log_HR', 'p_value',
+  'sourceLocation', 'pageNumber', 'confidence', 'notes'
+];
+
+function buildRevManBinaryRows(outcomes, studyId) {
+  return outcomes.filter(isBinaryOutcome).map(o => {
+    const eff = o.effectEstimate || {};
+    const effCols = buildBinaryEffectColumns(eff);
+    const ci = parseCI(eff.ci95);
+    const log = computeLogHR(eff);
+    return [
+      o.actualOutcomeName || '',
+      studyId,
+      o.timePoint || '',
+      o.populationType || '',
+      extractNumber(o.interventionGroup?.events_or_mean),
+      extractNumber(o.interventionGroup?.n_total),
+      extractNumber(o.comparisonGroup?.events_or_mean),
+      extractNumber(o.comparisonGroup?.n_total),
+      effCols.reported_RR, effCols.reported_OR, effCols.reported_HR, effCols.reported_RD,
+      ci.lower, ci.upper, log.log_HR, log.SE_log_HR,
+      (eff.pValue && !['-','不明','未抽出','NA','N/A'].includes(String(eff.pValue).trim())) ? eff.pValue : '',
+      o.sourceLocation || '',
+      o.pageNumber || '',
+      o.confidence || '',
+      (o.notes || '').replace(/[\n\t]/g, ' ')
+    ];
+  });
+}
+
+function toRevManBinaryTSV(outcomes, studyId) {
+  const rows = buildRevManBinaryRows(outcomes, studyId);
+  return { tsv: buildDelimitedTable(REVMAN_BINARY_HDRS, rows, '\t'), count: rows.length };
+}
+
+// === RevMan用 連続アウトカム TSV ===
+const REVMAN_CONT_HDRS = [
+  'outcome', 'study', 'timepoint', 'population', 'metric', 'scaleInfo',
+  'n_intervention', 'mean_intervention', 'sd_intervention', 'se_intervention',
+  'n_control', 'mean_control', 'sd_control', 'se_control',
+  'reported_MD', 'reported_SMD', 'reported_AdjMD',
+  'ci95_lower', 'ci95_upper', 'SE_from_CI', 'p_value',
+  'sd_or_se_label', 'sourceLocation', 'pageNumber', 'confidence', 'notes'
+];
+
+function buildRevManContinuousRows(outcomes, studyId) {
+  return outcomes.filter(o => !isBinaryOutcome(o)).map(o => {
+    const eff = o.effectEstimate || {};
+    const metric = inferMetric(o);
+    const effCols = buildContinuousEffectColumns(eff, metric);
+    const ci = parseCI(eff.ci95);
+    const sdSeLabel = o.sdOrSe || '';
+    const intSdSe = splitSdOrSe(o.interventionGroup, sdSeLabel);
+    const ctlSdSe = splitSdOrSe(o.comparisonGroup, sdSeLabel);
+    return [
+      o.actualOutcomeName || '',
+      studyId,
+      o.timePoint || '',
+      o.populationType || '',
+      metric,
+      '', // scaleInfo: 抽出フィールドに存在しないため空白（notes に記載あれば手動転記）
+      extractNumber(o.interventionGroup?.n_total),
+      extractNumber(o.interventionGroup?.events_or_mean),
+      intSdSe.sd, intSdSe.se,
+      extractNumber(o.comparisonGroup?.n_total),
+      extractNumber(o.comparisonGroup?.events_or_mean),
+      ctlSdSe.sd, ctlSdSe.se,
+      effCols.reported_MD, effCols.reported_SMD, effCols.reported_AdjMD,
+      ci.lower, ci.upper, computeSEFromCI(eff),
+      (eff.pValue && !['-','不明','未抽出','NA','N/A'].includes(String(eff.pValue).trim())) ? eff.pValue : '',
+      sdSeLabel,
+      o.sourceLocation || '',
+      o.pageNumber || '',
+      o.confidence || '',
+      (o.notes || '').replace(/[\n\t]/g, ' ')
+    ];
+  });
+}
+
+function toRevManContinuousTSV(outcomes, studyId) {
+  const rows = buildRevManContinuousRows(outcomes, studyId);
+  return { tsv: buildDelimitedTable(REVMAN_CONT_HDRS, rows, '\t'), count: rows.length };
+}
+
+// === R metafor 用ベクトル文字列ビルダー ===
+// 数値列: 空文字は NA、それ以外は数値リテラルとしてそのまま
+function rNumVec(values) {
+  const inner = values.map(v => (v === '' || v === null || v === undefined) ? 'NA' : String(v)).join(', ');
+  return `c(${inner})`;
+}
+// 文字列列: 空文字も NA_character_ にする（R での欠損扱い統一のため）
+function rStrVec(values) {
+  const inner = values.map(v => (v === '' || v === null || v === undefined) ? 'NA_character_' : ('"' + String(v).replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, ' ') + '"')).join(', ');
+  return `c(${inner})`;
+}
+
+function buildRDataFrameBlock(varName, headers, rows, numericCols) {
+  if (rows.length === 0) {
+    return `${varName} <- data.frame()  # 該当アウトカム0件\n`;
+  }
+  const colData = headers.map((h, i) => rows.map(r => r[i]));
+  const lines = headers.map((h, i) => {
+    const isNum = numericCols.has(h);
+    const vec = isNum ? rNumVec(colData[i]) : rStrVec(colData[i]);
+    const pad = ' '.repeat(Math.max(0, 20 - h.length));
+    return `  ${h}${pad}= ${vec}`;
+  });
+  return `${varName} <- data.frame(\n${lines.join(',\n')},\n  stringsAsFactors  = FALSE\n)\n`;
+}
+
+const R_BINARY_NUM_COLS = new Set([
+  'events_intervention', 'total_intervention', 'events_control', 'total_control',
+  'reported_RR', 'reported_OR', 'reported_HR', 'reported_RD',
+  'ci95_lower', 'ci95_upper', 'log_HR', 'SE_log_HR', 'pageNumber'
+]);
+
+function toRMetaforBinaryScript(outcomes, studyId) {
+  const rows = buildRevManBinaryRows(outcomes, studyId);
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const header = `# DataEx 自動生成 — メタ分析用 R スクリプト (二値アウトカム / Time-to-event)\n# 生成日時: ${ts}\n# 研究: ${studyId}\n# 該当アウトカム: ${rows.length}件\n\nlibrary(metafor)\n\n`;
+  const df = buildRDataFrameBlock('dat_binary', REVMAN_BINARY_HDRS, rows, R_BINARY_NUM_COLS);
+  const usage = `\n# 効果量計算の例:\n# # OR メタ分析:\n# escalc(measure="OR", ai=events_intervention, n1i=total_intervention,\n#                       ci=events_control,      n2i=total_control, data=dat_binary)\n#\n# # RR メタ分析:\n# escalc(measure="RR", ai=events_intervention, n1i=total_intervention,\n#                       ci=events_control,      n2i=total_control, data=dat_binary)\n#\n# # HR の generic inverse variance（log_HR と SE_log_HR が取れている行のみ）:\n# rma(yi=log_HR, sei=SE_log_HR, data=subset(dat_binary, !is.na(log_HR) & !is.na(SE_log_HR)))\n`;
+  return { script: header + df + usage, count: rows.length };
+}
+
+const R_CONT_NUM_COLS = new Set([
+  'n_intervention', 'mean_intervention', 'sd_intervention', 'se_intervention',
+  'n_control', 'mean_control', 'sd_control', 'se_control',
+  'reported_MD', 'reported_SMD', 'reported_AdjMD',
+  'ci95_lower', 'ci95_upper', 'SE_from_CI', 'pageNumber'
+]);
+
+function toRMetaforContinuousScript(outcomes, studyId) {
+  const rows = buildRevManContinuousRows(outcomes, studyId);
+  const ts = new Date().toISOString().replace('T', ' ').substring(0, 19);
+  const header = `# DataEx 自動生成 — メタ分析用 R スクリプト (連続アウトカム)\n# 生成日時: ${ts}\n# 研究: ${studyId}\n# 該当アウトカム: ${rows.length}件\n# metric 列で post-value / change-from-baseline / adjusted-difference / baseline-value を識別\n\nlibrary(metafor)\n\n`;
+  const df = buildRDataFrameBlock('dat_continuous', REVMAN_CONT_HDRS, rows, R_CONT_NUM_COLS);
+  const usage = `\n# 解析の例 (metric でフィルタして使用):\n# # 術後値で MD メタ分析:\n# dat_post <- subset(dat_continuous, metric == "post-value")\n# escalc(measure="MD", m1i=mean_intervention, sd1i=sd_intervention, n1i=n_intervention,\n#                       m2i=mean_control,      sd2i=sd_control,      n2i=n_control, data=dat_post)\n#\n# # 変化量で MD メタ分析:\n# dat_change <- subset(dat_continuous, metric == "change-from-baseline")\n# escalc(measure="MD", m1i=mean_intervention, sd1i=sd_intervention, n1i=n_intervention,\n#                       m2i=mean_control,      sd2i=sd_control,      n2i=n_control, data=dat_change)\n#\n# # ANCOVA 調整済み MD は generic inverse variance:\n# dat_adj <- subset(dat_continuous, metric == "adjusted-difference")\n# rma(yi=reported_AdjMD, sei=SE_from_CI, data=subset(dat_adj, !is.na(reported_AdjMD) & !is.na(SE_from_CI)))\n#\n# # SE のみ報告されている行は SD = SE * sqrt(n) で変換してから escalc に投入:\n# # 例: dat$sd_intervention <- ifelse(is.na(dat$sd_intervention) & !is.na(dat$se_intervention),\n# #                                    dat$se_intervention * sqrt(dat$n_intervention), dat$sd_intervention)\n`;
+  return { script: header + df + usage, count: rows.length };
+}
+
 /* ============================================================
    SECTION 10: EXTRACTION PIPELINE (多層パイプライン)
    ============================================================ */
@@ -2204,6 +2491,41 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
     clipCopy(t) && showToast("全CSVコピー完了");
   };
   const copyBaselineTSV = () => { result?.baselineCharacteristics && clipCopy(toDelimited(BL_HDRS, result.baselineCharacteristics.map(baselineRow), "\t")) && showToast("患者背景TSVコピー完了"); };
+
+  // === メタ分析ソフト連携用エクスポート（read-only / 副作用なし） ===
+  // 抽出済み result.extractedOutcomes から純粋関数で変換 → クリップボードへコピー。
+  // result への書き込みは一切行わない。既存の TSV/CSV/保存 ボタンとは独立。
+  const handleMetaExport = (kind) => {
+    if (!result?.extractedOutcomes?.length) { showToast("抽出済みアウトカムがありません", "error"); return; }
+    const studyId = deriveStudyId(pdfFile?.name);
+    const totalCount = result.extractedOutcomes.length;
+    let payload = '', label = '', count = 0;
+    try {
+      if (kind === 'revman-binary') {
+        const r = toRevManBinaryTSV(result.extractedOutcomes, studyId);
+        payload = r.tsv; count = r.count; label = 'RevMan用 二値CSV(タブ区切り)';
+      } else if (kind === 'revman-continuous') {
+        const r = toRevManContinuousTSV(result.extractedOutcomes, studyId);
+        payload = r.tsv; count = r.count; label = 'RevMan用 連続CSV(タブ区切り)';
+      } else if (kind === 'r-binary') {
+        const r = toRMetaforBinaryScript(result.extractedOutcomes, studyId);
+        payload = r.script; count = r.count; label = 'R metafor 二値スクリプト';
+      } else if (kind === 'r-continuous') {
+        const r = toRMetaforContinuousScript(result.extractedOutcomes, studyId);
+        payload = r.script; count = r.count; label = 'R metafor 連続スクリプト';
+      } else {
+        return;
+      }
+    } catch (e) {
+      console.error(e); showToast(`変換失敗: ${e.message}`, 'error'); return;
+    }
+    if (count === 0) { showToast(`⚠️ ${label}: 該当アウトカム0件`, 'error'); return; }
+    if (!clipCopy(payload)) { showToast(`クリップボードコピー失敗`, 'error'); return; }
+    const skipped = totalCount - count;
+    const detail = skipped > 0 ? `${totalCount}件中${count}件を変換 (${skipped}件は対象外: 別タイプ)` : `${count}件を変換`;
+    showToast(`✅ ${label} をコピー (${detail}) — 研究ID: ${studyId}`, skipped > 0 ? 'info' : 'success');
+  };
+
   const saveSession = () => {
     const s = { pico, outcomes, result, model, keyCount: apiKeys.length, timestamp: new Date().toISOString() };
     const b = new Blob([JSON.stringify(s, null, 2)], { type: 'application/json' });
@@ -2344,6 +2666,19 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
                   </div>
                   <button onClick={copyAllTSV} className="text-[9px] bg-white border border-slate-300 hover:bg-slate-50 px-2 py-1 rounded flex items-center gap-1 font-bold"><CopyIcon size={10}/>TSV</button>
                   <button onClick={copyAllCSV} className="text-[9px] bg-white border border-slate-300 hover:bg-slate-50 px-2 py-1 rounded flex items-center gap-1 font-bold"><CopyIcon size={10}/>CSV</button>
+                  {/* メタ分析ソフト連携: 抽出済データを RevMan / R metafor 形式に変換してクリップボードへ */}
+                  <select
+                    title="メタ分析ソフト用に変換してクリップボードへコピー（既存抽出データのみ参照、書き換えなし）"
+                    value=""
+                    onChange={(e) => { const v = e.target.value; e.target.value = ''; if (v) handleMetaExport(v); }}
+                    className="text-[9px] bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 px-2 py-1 rounded font-bold text-emerald-800 cursor-pointer"
+                  >
+                    <option value="">📊 メタ分析用 ▼</option>
+                    <option value="revman-binary">RevMan用 二値CSV</option>
+                    <option value="revman-continuous">RevMan用 連続CSV</option>
+                    <option value="r-binary">R metafor 二値スクリプト</option>
+                    <option value="r-continuous">R metafor 連続スクリプト</option>
+                  </select>
                 </div>
               </div>
 
