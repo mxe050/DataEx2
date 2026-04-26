@@ -2167,6 +2167,100 @@ function ApiDiagPanel({ onClose }) {
   );
 }
 
+// メタ分析ソフト連携プレビューモーダル
+// 抽出済アウトカムを変換した結果を表で表示し、TSV/CSV/Rスクリプト形式でクリップボードコピーできる
+function MetaPreviewModal({ preview, onClose, onCopy }) {
+  if (!preview) return null;
+  const { kind, studyId, headers, rows } = preview;
+  const title = kind === 'binary' ? '📊 二値アウトカム / Time-to-event プレビュー' : '📈 連続アウトカム プレビュー';
+  const subtitle = kind === 'binary'
+    ? 'RR / OR / HR / RD のメタ分析に使用できる形式。HRが取れる行は log_HR と SE_log_HR を自動計算。'
+    : 'MD / SMD / 調整済MD のメタ分析に使用できる形式。同じアウトカムの metric 違い (post-value / change-from-baseline / adjusted-difference / baseline-value) は別行として並列表示。';
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-3" onClick={onClose}>
+      <div className="bg-white rounded-lg shadow-2xl w-full max-w-[95vw] max-h-[92vh] flex flex-col" onClick={e => e.stopPropagation()}>
+        {/* ヘッダー */}
+        <div className="flex items-center justify-between px-4 py-2 border-b border-slate-200 bg-gradient-to-r from-emerald-50 to-teal-50 flex-shrink-0">
+          <div className="flex items-center gap-3">
+            <span className="font-bold text-sm text-emerald-900">{title}</span>
+            <span className="text-[11px] text-slate-600 font-mono bg-white border border-slate-200 px-2 py-0.5 rounded">研究ID: {studyId}</span>
+            <span className="text-[11px] text-slate-700 font-bold">{rows.length}件</span>
+          </div>
+          <button onClick={onClose} className="text-slate-400 hover:text-red-600 text-xl font-bold leading-none px-2" title="閉じる">×</button>
+        </div>
+
+        {/* 説明バー */}
+        <div className="px-4 py-1.5 bg-slate-50 border-b border-slate-200 text-[10px] text-slate-600 flex-shrink-0">
+          {subtitle}
+        </div>
+
+        {/* 表本体（横スクロール可能） */}
+        <div className="flex-1 overflow-auto bg-slate-50">
+          {rows.length === 0 ? (
+            <div className="p-8 text-center text-slate-500 text-sm">該当するアウトカムがありません</div>
+          ) : (
+            <table className="text-[10px] border-collapse" style={{ minWidth: '100%' }}>
+              <thead className="sticky top-0 bg-slate-200 border-b-2 border-slate-400 z-10">
+                <tr>
+                  <th className="px-2 py-1.5 text-left font-bold text-slate-700 border-r border-slate-300 bg-slate-300 sticky left-0 z-20" style={{ minWidth: '40px' }}>#</th>
+                  {headers.map(h => (
+                    <th key={h} className="px-2 py-1.5 text-left font-bold text-slate-700 border-r border-slate-300 whitespace-nowrap" title={h}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {rows.map((r, i) => (
+                  <tr key={i} className={i % 2 ? 'bg-white' : 'bg-slate-50'}>
+                    <td className={`px-2 py-1 font-bold text-slate-500 border-r border-slate-200 sticky left-0 ${i % 2 ? 'bg-white' : 'bg-slate-50'}`}>{i + 1}</td>
+                    {r.map((c, j) => {
+                      const isEmpty = c === '' || c === null || c === undefined;
+                      const cellStr = isEmpty ? '—' : String(c);
+                      return (
+                        <td key={j}
+                            className={`px-2 py-1 border-r border-slate-200 whitespace-nowrap ${isEmpty ? 'bg-amber-50 text-amber-300 italic' : 'text-slate-800'}`}
+                            title={isEmpty ? '抽出失敗 / 該当なし — RevManでは空欄、Rでは NA' : cellStr}>
+                          {cellStr}
+                        </td>
+                      );
+                    })}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        {/* フッター: 凡例 + コピーボタン */}
+        <div className="flex items-center justify-between px-4 py-2 border-t border-slate-200 bg-slate-50 flex-shrink-0 gap-3 flex-wrap">
+          <div className="text-[10px] text-slate-600 flex items-center gap-2">
+            <span className="bg-amber-50 text-amber-400 italic border border-amber-200 px-1.5 py-0.5 rounded">—</span>
+            <span>抽出失敗（RevManでは空欄、Rでは NA として扱われる）</span>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            <button onClick={() => onCopy('tsv')}
+              disabled={rows.length === 0}
+              className="text-[11px] bg-emerald-600 hover:bg-emerald-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded font-bold flex items-center gap-1">
+              <CopyIcon size={11}/>RevMan用 TSV
+            </button>
+            <button onClick={() => onCopy('csv')}
+              disabled={rows.length === 0}
+              className="text-[11px] bg-blue-600 hover:bg-blue-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded font-bold flex items-center gap-1">
+              <CopyIcon size={11}/>CSV
+            </button>
+            <button onClick={() => onCopy('r')}
+              disabled={rows.length === 0}
+              className="text-[11px] bg-purple-600 hover:bg-purple-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white px-3 py-1.5 rounded font-bold flex items-center gap-1">
+              <CopyIcon size={11}/>R metafor スクリプト
+            </button>
+            <button onClick={onClose} className="text-[11px] bg-white border border-slate-300 hover:bg-slate-100 text-slate-700 px-3 py-1.5 rounded font-bold">閉じる</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function StageIndicator({ currentStage, progress, message }) {
   const stages = [
     { id: 'stage1', label: 'PDF準備', icon: FileText },
@@ -2212,6 +2306,8 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
   const modelRef = useRef(initialModel);
   // API診断パネルの開閉
   const [showDiag, setShowDiag] = useState(false);
+  // メタ分析プレビュー: null か { kind: 'binary'|'continuous', studyId, headers, rows }
+  const [metaPreview, setMetaPreview] = useState(null);
   useEffect(() => { modelRef.current = model; }, [model]);
   const handleModelChange = (newModel) => {
     if (!GEMINI_MODELS.find(m => m.id === newModel)) return;
@@ -2492,38 +2588,49 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
   };
   const copyBaselineTSV = () => { result?.baselineCharacteristics && clipCopy(toDelimited(BL_HDRS, result.baselineCharacteristics.map(baselineRow), "\t")) && showToast("患者背景TSVコピー完了"); };
 
-  // === メタ分析ソフト連携用エクスポート（read-only / 副作用なし） ===
-  // 抽出済み result.extractedOutcomes から純粋関数で変換 → クリップボードへコピー。
+  // === メタ分析ソフト連携用プレビュー（read-only / 副作用なし） ===
+  // 抽出済み result.extractedOutcomes を変換した「表」をモーダルで表示。
+  // ユーザーが内容を確認した後、TSV/CSV/Rスクリプト形式でクリップボードにコピー。
   // result への書き込みは一切行わない。既存の TSV/CSV/保存 ボタンとは独立。
-  const handleMetaExport = (kind) => {
+  const openMetaPreview = (kind) => {
     if (!result?.extractedOutcomes?.length) { showToast("抽出済みアウトカムがありません", "error"); return; }
     const studyId = deriveStudyId(pdfFile?.name);
-    const totalCount = result.extractedOutcomes.length;
-    let payload = '', label = '', count = 0;
+    const headers = kind === 'binary' ? REVMAN_BINARY_HDRS : REVMAN_CONT_HDRS;
+    const rows = kind === 'binary'
+      ? buildRevManBinaryRows(result.extractedOutcomes, studyId)
+      : buildRevManContinuousRows(result.extractedOutcomes, studyId);
+    if (rows.length === 0) {
+      const label = kind === 'binary' ? '二値/Time-to-event' : '連続';
+      showToast(`該当する${label}アウトカムがありません`, "error"); return;
+    }
+    setMetaPreview({ kind, studyId, headers, rows });
+  };
+
+  const copyMetaPreview = (format) => {
+    if (!metaPreview) return;
+    const { kind, studyId, headers, rows } = metaPreview;
+    let payload = '', label = '';
     try {
-      if (kind === 'revman-binary') {
-        const r = toRevManBinaryTSV(result.extractedOutcomes, studyId);
-        payload = r.tsv; count = r.count; label = 'RevMan用 二値CSV(タブ区切り)';
-      } else if (kind === 'revman-continuous') {
-        const r = toRevManContinuousTSV(result.extractedOutcomes, studyId);
-        payload = r.tsv; count = r.count; label = 'RevMan用 連続CSV(タブ区切り)';
-      } else if (kind === 'r-binary') {
-        const r = toRMetaforBinaryScript(result.extractedOutcomes, studyId);
-        payload = r.script; count = r.count; label = 'R metafor 二値スクリプト';
-      } else if (kind === 'r-continuous') {
-        const r = toRMetaforContinuousScript(result.extractedOutcomes, studyId);
-        payload = r.script; count = r.count; label = 'R metafor 連続スクリプト';
+      if (format === 'tsv') {
+        payload = buildDelimitedTable(headers, rows, '\t');
+        label = kind === 'binary' ? 'RevMan用 二値TSV' : 'RevMan用 連続TSV';
+      } else if (format === 'csv') {
+        payload = buildDelimitedTable(headers, rows, ',');
+        label = kind === 'binary' ? 'RevMan用 二値CSV' : 'RevMan用 連続CSV';
+      } else if (format === 'r') {
+        const r = kind === 'binary'
+          ? toRMetaforBinaryScript(result.extractedOutcomes, studyId)
+          : toRMetaforContinuousScript(result.extractedOutcomes, studyId);
+        payload = r.script;
+        label = kind === 'binary' ? 'R metafor 二値スクリプト' : 'R metafor 連続スクリプト';
       } else {
         return;
       }
     } catch (e) {
       console.error(e); showToast(`変換失敗: ${e.message}`, 'error'); return;
     }
-    if (count === 0) { showToast(`⚠️ ${label}: 該当アウトカム0件`, 'error'); return; }
     if (!clipCopy(payload)) { showToast(`クリップボードコピー失敗`, 'error'); return; }
-    const skipped = totalCount - count;
-    const detail = skipped > 0 ? `${totalCount}件中${count}件を変換 (${skipped}件は対象外: 別タイプ)` : `${count}件を変換`;
-    showToast(`✅ ${label} をコピー (${detail}) — 研究ID: ${studyId}`, skipped > 0 ? 'info' : 'success');
+    showToast(`✅ ${label} をコピー (${rows.length}件) — 研究ID: ${studyId}`, 'success');
   };
 
   const saveSession = () => {
@@ -2575,6 +2682,7 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
       </header>
 
       {showDiag && <ApiDiagPanel onClose={() => setShowDiag(false)}/>}
+      {metaPreview && <MetaPreviewModal preview={metaPreview} onClose={() => setMetaPreview(null)} onCopy={copyMetaPreview}/>}
 
       <main className={`flex-1 flex flex-col min-h-0 w-full overflow-hidden ${status==='complete'?'p-1.5 sm:p-3':''}`}>
         {status !== 'complete' && (
@@ -2666,18 +2774,16 @@ function ExtractorPage({ apiKeys, model: initialModel, onBack }) {
                   </div>
                   <button onClick={copyAllTSV} className="text-[9px] bg-white border border-slate-300 hover:bg-slate-50 px-2 py-1 rounded flex items-center gap-1 font-bold"><CopyIcon size={10}/>TSV</button>
                   <button onClick={copyAllCSV} className="text-[9px] bg-white border border-slate-300 hover:bg-slate-50 px-2 py-1 rounded flex items-center gap-1 font-bold"><CopyIcon size={10}/>CSV</button>
-                  {/* メタ分析ソフト連携: 抽出済データを RevMan / R metafor 形式に変換してクリップボードへ */}
+                  {/* メタ分析ソフト連携: 抽出済データを表でプレビューしてからクリップボードへ */}
                   <select
-                    title="メタ分析ソフト用に変換してクリップボードへコピー（既存抽出データのみ参照、書き換えなし）"
+                    title="メタ分析ソフト用にデータを変換して表で確認 → モーダル内のボタンで TSV/CSV/R形式コピー（既存抽出データへの書き換えなし）"
                     value=""
-                    onChange={(e) => { const v = e.target.value; e.target.value = ''; if (v) handleMetaExport(v); }}
+                    onChange={(e) => { const v = e.target.value; e.target.value = ''; if (v) openMetaPreview(v); }}
                     className="text-[9px] bg-emerald-50 border border-emerald-300 hover:bg-emerald-100 px-2 py-1 rounded font-bold text-emerald-800 cursor-pointer"
                   >
                     <option value="">📊 メタ分析用 ▼</option>
-                    <option value="revman-binary">RevMan用 二値CSV</option>
-                    <option value="revman-continuous">RevMan用 連続CSV</option>
-                    <option value="r-binary">R metafor 二値スクリプト</option>
-                    <option value="r-continuous">R metafor 連続スクリプト</option>
+                    <option value="binary">二値 / Time-to-event をプレビュー</option>
+                    <option value="continuous">連続アウトカムをプレビュー</option>
                   </select>
                 </div>
               </div>
